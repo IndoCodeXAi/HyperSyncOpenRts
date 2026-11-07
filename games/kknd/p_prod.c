@@ -1,0 +1,366 @@
+#define _DEFAULT_SOURCE
+#include "engine.h"
+#include "info.h"
+#include "kknd.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+
+/* OpenKrush economy: one authored row owns cost, producer, duration and tech. */
+static const StaticProductDefinition KKND_PRODUCTS[] = {
+#define KK_PRODUCT(id,faction,category,kind,type,maker,cost,ticks,tech,limit,label) \
+    { (id),(id),(label),(cost),0,(kind),(type),(faction),{(maker)},1,{(maker)},1, {0}, false },
+#include "products.inc"
+#undef KK_PRODUCT
+    {0}, /* Sentinel also permits an empty native product table in C11. */
+};
+static const struct { int id, ticks, level, limit; } rules[] = {
+#define KK_PRODUCT(id,faction,category,kind,type,maker,cost,ticks,tech,limit,label) \
+    {(id),(ticks),(tech),(limit)},
+#include "products.inc"
+#undef KK_PRODUCT
+    {0},
+};
+static const StaticProductDefinition research_product = {
+    .ui_id = KKND_RESEARCH, .label = "Research", .cost = 0,
+};
+static int product_count(void) {
+    return (int)(sizeof(KKND_PRODUCTS) / sizeof(KKND_PRODUCTS[0])) - 1;
+}
+
+int G_ModelGetProducts(const RtsGameModel *model, int owner,
+                       StaticProductDefinition *out, int max_products) {
+    (void)model;
+    if (!out || max_products <= 0) return 0;
+    int faction = -1;
+    for (thinker_t *th = thinkercap.next; th && th != &thinkercap && faction < 0; th = th->next) {
+        if (th->function != P_MobjThinker) continue;
+        const mobj_t *u = (mobj_t *)th;
+        if (u->owner != owner || u->hp <= 0 || u->remove) continue;
+        for (int i = 0; i < product_count(); ++i)
+            if (KKND_PRODUCTS[i].product_type == u->type_id) { faction = KKND_PRODUCTS[i].faction; break; }
+    }
+    int count = 0;
+    for (int i = 0; i < product_count() && count < max_products; ++i)
+        if (faction < 0 || faction == KKND_PRODUCTS[i].faction) out[count++] = KKND_PRODUCTS[i];
+    return count;
+}
+
+const StaticProductDefinition *G_ModelProductByUIId(const RtsGameModel *model, int ui_id) {
+    (void)model;
+    if (ui_id == KKND_RESEARCH) return &research_product;
+    for (int i = 0; i < product_count(); ++i)
+        if (KKND_PRODUCTS[i].ui_id == ui_id) return &KKND_PRODUCTS[i];
+    return NULL;
+}
+
+const StaticProductDefinition *G_ModelProductByClassType(const RtsGameModel *model,
+                                                         int product_class,
+                                                         int product_type) {
+    (void)model;
+    for (int i = 0; i < product_count(); ++i)
+        if ((int)KKND_PRODUCTS[i].product_class == product_class &&
+            KKND_PRODUCTS[i].product_type == product_type)
+            return &KKND_PRODUCTS[i];
+    return NULL;
+}
+
+bool G_ModelProducerHasTech(const mobj_t *producer, const StaticProductDefinition *product) {
+    for (int i = 0; i < product_count(); ++i)
+        if (rules[i].id == product->ui_id) return producer->research.level >= rules[i].level;
+    return false;
+}
+
+int KK_NextTechLevel(const mobj_t *actor) {
+    int next = 0;
+    if ((actor->type_id == MT_SURV_OUTPOST || actor->type_id == MT_MUTE_CLANHALL) && actor->research.level < 2)
+        next = actor->research.level + 1; /* Radar and enemy radar. */
+    if (actor->type_id == MT_SURV_RESEARCH_LAB || actor->type_id == MT_MUTE_ALCHEMY_HALL)
+        return actor->research.level < 5 ? actor->research.level + 1 : 0;
+    for (int i = 0; i < product_count(); ++i)
+        if (KKND_PRODUCTS[i].makers[0] == actor->type_id && rules[i].level > actor->research.level &&
+            (!next || rules[i].level < next)) next = rules[i].level;
+    return next;
+}
+
+bool G_ModelProductAvailable(const RtsGameModel *model, int owner,
+                             const StaticProductDefinition *product) {
+    if (!product) return false;
+    for (int i = 0; i < product_count(); ++i)
+        if (rules[i].id == product->ui_id && rules[i].limit &&
+            G_CountPlannedActors(owner, product->product_type) >= rules[i].limit) return false;
+    if (product->ui_id == KKND_RESEARCH)
+        return G_ModelHasActorType(model, owner, MT_SURV_RESEARCH_LAB) ||
+               G_ModelHasActorType(model, owner, MT_MUTE_ALCHEMY_HALL);
+    for (int i = 0; i < product->prerequisite_count; ++i)
+        if (!G_ModelHasActorType(model, owner, product->prerequisites[i])) return false;
+    for (thinker_t *th = thinkercap.next; th && th != &thinkercap; th = th->next) {
+        if (th->function != P_MobjThinker) continue;
+        const mobj_t *u = (mobj_t *)th;
+        if (u->owner != owner || u->hp <= 0 || u->remove || gameinfo->states[u->core.state_id].group == 6) continue;
+        for (int i = 0; i < product->maker_count; ++i)
+            if (product->makers[i] == u->type_id && G_ModelProducerHasTech(u, product)) return true;
+    }
+    return false;
+}
+
+uint16_t G_ModelActorIdForProduct(const StaticProductDefinition *product) {
+    return product ? (uint16_t)product->product_type : 0;
+}
+
+int G_ModelBuildingFrameForProduct(const StaticProductDefinition *product) {
+    (void)product;
+    return 0;
+}
+
+int G_ModelBuildingStateForProduct(const gameinfo_t *game_info,
+                                  const StaticProductDefinition *product) {
+    (void)game_info; (void)product;
+    return -1;
+}
+
+int G_ModelProductTrainingTimeMs(const StaticProductDefinition *product) {
+    if (!product) return 0;
+    for (int i = 0; i < product_count(); ++i)
+        if (rules[i].id == product->ui_id) return rules[i].ticks * 40;
+    return 0;
+}
+
+static bool kk_is_drillrig(uint16_t type) {
+    return type == MT_SURV_DRILLRIG || type == MT_MUTE_DRILLRIG;
+}
+
+static bool kk_is_derrick(uint16_t type) {
+    return type == MT_SURV_MOBILE_DERRICK || type == MT_MUTE_MOBILE_DERRICK;
+}
+
+static const mobjtype_t *kk_actor_type(uint16_t type) {
+    for (int i = 0; i < num_actor_types; ++i)
+        if (actor_types[i].id == type) return &actor_types[i];
+    return NULL;
+}
+
+/* The Drill Rig product is the mobile derrick deploying: once its build time
+ * has run, the derrick becomes the rig where it stands (like A_Deploy) instead
+ * of a rig spawning beside it. Returning true tells the ticker the release
+ * has been handled. */
+bool G_ModelStartProductionRelease(RtsGameModel *model, mobj_t *producer,
+                                   const StaticProductDefinition *product,
+                                   uint16_t actor_id) {
+    (void)model; (void)product;
+    if (!producer || !kk_is_derrick(producer->type_id) || !kk_is_drillrig(actor_id)) return false;
+    const mobjtype_t *rig = kk_actor_type(actor_id);
+    if (!rig) return false;
+    P_FreeMobjProduction(producer);
+    P_ClearMove(producer);
+    producer->movement.order_id = 0;
+    producer->attack.target = NULL;
+    producer->core.momentum = fixed3_zero();
+    producer->core.sprite_name[0] = '\0';
+    producer->speed = 0;
+    producer->max_hp = rig->max_hp;
+    producer->hp = rig->max_hp;
+    producer->radius = FIXED_LIT(1.2);
+    P_ApplyActorTypeDefaults(producer, rig);
+    P_SetMobjState(producer, gameinfo->mobjinfo[actor_id].spawnstate);
+    return true;
+}
+
+bool G_ModelSpecialReleaseSpawnPoint(const RtsGameModel *model, const mobj_t *producer,
+                                     const StaticProductDefinition *product,
+                                     const mobj_t *new_unit,
+                                     fixed2_t *out) {
+    (void)model; (void)producer; (void)product; (void)new_unit; (void)out;
+    return false;
+}
+
+static void append_ui_script(char *dst, size_t dst_size, const char *fmt, ...) {
+    if (!dst || dst_size == 0) return;
+    size_t len = strlen(dst);
+    if (len >= dst_size - 1) return;
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(dst + len, dst_size - len, fmt, args);
+    va_end(args);
+}
+
+void G_ModelBuildUIScript(const RtsGameModel *model,
+                          const RtsRenderSnapshot *snapshot,
+                          char *dst, size_t dst_size) {
+    if (!model || !snapshot || !dst || dst_size == 0) return;
+    dst[0] = '\0';
+    append_ui_script(dst, dst_size, "ui kknd 1\n");
+    append_ui_script(dst, dst_size, "x 400 y 3 text \"Oil %d\"\n",
+                     snapshot->player_resources[consoleplayer][0]);
+
+    int selected_idx = -1;
+    for (int i = 0; i < snapshot->unit_count; ++i) {
+        if (snapshot->units[i].selected && snapshot->units[i].owner == consoleplayer) {
+            selected_idx = i;
+            break;
+        }
+    }
+    if (selected_idx < 0) return;
+
+    uint16_t producer_type = snapshot->units[selected_idx].type_id;
+    for (int i = 0; i < product_count(); ++i) {
+        const StaticProductDefinition *product = &KKND_PRODUCTS[i];
+        bool is_maker = false;
+        for (int m = 0; m < product->maker_count; ++m)
+            if (product->makers[m] == (int)producer_type) { is_maker = true; break; }
+        if (!is_maker) continue;
+        /* Every button at the top of the product grid. */
+        int by = 32;
+        bool available = G_ModelProductAvailable(model, consoleplayer, product) &&
+                         snapshot->player_resources[consoleplayer][0] >= product->cost;
+        append_ui_script(dst, dst_size, "x 864 y %d btn %d enabled %d pic %d\n",
+                         by, product->ui_id, available ? 1 : 0, product->icon_frame);
+    }
+}
+
+/* Ids pair up by faction except the Mutant-only rows, so read the faction
+ * from the catalog entry of any building or unit the owner already has. */
+int KK_OwnerFaction(int owner) {
+    for (thinker_t *th = thinkercap.next; th && th != &thinkercap; th = th->next) {
+        if (th->function != P_MobjThinker) continue;
+        const mobj_t *u = (mobj_t *)th;
+        if (u->owner != owner || u->hp <= 0 || u->remove) continue;
+        for (int i = 0; i < product_count(); ++i)
+            if (KKND_PRODUCTS[i].product_type == u->type_id) return KKND_PRODUCTS[i].faction;
+    }
+    return -1;
+}
+
+/* The derrick that deploys into a rig of `ui_id`, or 0. */
+static int kk_derrick_for_rig(int ui_id) {
+    const StaticProductDefinition *rig = G_ModelProductByUIId(NULL, ui_id);
+    if (!rig || !kk_is_drillrig((uint16_t)rig->product_type)) return 0;
+    for (int i = 0; i < product_count(); ++i)
+        if (KKND_PRODUCTS[i].product_type == rig->makers[0]) return KKND_PRODUCTS[i].ui_id;
+    return 0;
+}
+
+static int kk_queued(int owner, uint16_t actor_type) {
+    int n = 0;
+    for (thinker_t *th = thinkercap.next; th && th != &thinkercap; th = th->next) {
+        const mobj_t *u = (mobj_t *)th;
+        if (th->function == P_MobjThinker && u->owner == owner && !u->remove && u->hp > 0 &&
+            u->production && u->production->actor_id == actor_type) n += u->production->queue_count;
+    }
+    return n;
+}
+
+/* A rig goal counts rigs (alive or deploying) plus derricks still in the
+ * shop's queue. An idle derrick does not count, so the goal goes on to order
+ * its deployment. */
+static int kk_ai_owned(int owner, int ui_id) {
+    int derrick = kk_derrick_for_rig(ui_id);
+    const StaticProductDefinition *product = derrick ? G_ModelProductByUIId(NULL, derrick) : NULL;
+    return G_AiCatalogOwned(owner, ui_id) +
+           (product ? kk_queued(owner, (uint16_t)product->product_type) : 0);
+}
+
+static int kk_ai_can_purchase(const level_t *map, int owner, int ui_id) {
+    int derrick = kk_derrick_for_rig(ui_id);
+    if (derrick && G_AiCatalogCanPurchase(map, owner, ui_id) == AI_BUY_BLOCKED)
+        return G_AiCatalogCanPurchase(map, owner, derrick);
+    return G_AiCatalogCanPurchase(map, owner, ui_id);
+}
+
+static bool ready(const mobj_t *u) {
+    return u && !u->remove && u->hp > 0 && gameinfo->states[u->core.state_id].group != 6;
+}
+static bool is_lab(const mobj_t *u) {
+    return u->type_id == MT_SURV_RESEARCH_LAB || u->type_id == MT_MUTE_ALCHEMY_HALL;
+}
+
+bool KK_Research(mobj_t *target) {
+    if (!ready(target)) return false;
+    int next = KK_NextTechLevel(target);
+    mobj_t *lab = NULL;
+    for (thinker_t *th = thinkercap.next; th != &thinkercap; th = th->next) {
+        if (th->function != P_MobjThinker) continue;
+        mobj_t *u = (mobj_t *)th;
+        if (!ready(u) || u->owner != target->owner || !is_lab(u)) continue;
+        if (u->research.target == target->id) {
+            u->research.target = 0; /* Cancel: paid research is not refunded. */
+            return true;
+        }
+        if (!u->research.target && !lab) lab = u;
+    }
+    if (!lab || !next) return false;
+    static const int rates[] = {100,90,80,70,60,50};
+    int rate = rates[lab->research.level];
+    lab->research.target = target->id;
+    lab->research.next_level = next;
+    /* Preserve the reference's arithmetic order: only the per-level term is discounted. */
+    lab->research.total_cost = lab->research.remaining_cost = 250 + 500 * next * rate / 100;
+    lab->research.total_time = lab->research.remaining_time = 400 + 300 * next * rate / 100;
+    lab->research.clock = 0;
+    return true;
+}
+
+void A_KkndResearch(mobj_t *lab) {
+    if (!lab->research.target) return;
+    mobj_t *target = NULL;
+    for (thinker_t *th = thinkercap.next; th != &thinkercap; th = th->next) {
+        if (th->function != P_MobjThinker) continue;
+        mobj_t *u = (mobj_t *)th;
+        if (u->id == lab->research.target) { target = u; break; }
+    }
+    if (!ready(target) || target->owner != lab->owner) {
+        lab->research.target = 0;
+        return;
+    }
+    /* Reference normal speed is 25 tics/s; keep exact progress at our 30 Hz. */
+    lab->research.clock += 25;
+    if (lab->research.clock < RTS_TICRATE) return;
+    lab->research.clock -= RTS_TICRATE;
+    int remaining = lab->research.remaining_time == 1 ? 0 :
+        lab->research.total_cost * lab->research.remaining_time / lab->research.total_time;
+    int cost = lab->research.remaining_cost - remaining;
+    if (level.player_resources[lab->owner][0] < cost) return;
+    level.player_resources[lab->owner][0] -= cost;
+    lab->research.remaining_cost -= cost;
+    if (--lab->research.remaining_time == 0) {
+        target->research.level = lab->research.next_level;
+        lab->research.target = 0;
+    }
+}
+
+static bool kk_ai_purchase(level_t *map, int owner, int ui_id) {
+    int derrick = kk_derrick_for_rig(ui_id);
+    if (derrick && G_AiCatalogCanPurchase(map, owner, ui_id) == AI_BUY_BLOCKED)
+        return G_AiCatalogPurchase(map, owner, derrick);
+    return G_AiCatalogPurchase(map, owner, ui_id);
+}
+
+bool G_PlayerBuildProduct(mobj_t *producer, const StaticProductDefinition *product) {
+    return product && product->ui_id == KKND_RESEARCH ? KK_Research(producer) : G_QueueProduct(producer, product);
+}
+
+int G_ModelRadarLevel(int owner) {
+    int radar = 0;
+    for (thinker_t *th = thinkercap.next; th && th != &thinkercap; th = th->next) {
+        if (th->function != P_MobjThinker) continue;
+        const mobj_t *u = (mobj_t *)th;
+        if (u->owner == owner && !u->remove && u->hp > 0 &&
+            gameinfo->states[u->core.state_id].group != 6 &&
+            (u->type_id == MT_SURV_OUTPOST || u->type_id == MT_MUTE_CLANHALL) &&
+            u->research.level > radar) radar = u->research.level;
+    }
+    return radar;
+}
+
+static const AiGameInterface kk_ai_interface = {
+    .name = "kknd",
+    .features = AI_FEATURE_ALL,
+    .player_level = P_AiLevelNonHuman,
+    .owned = kk_ai_owned,
+    .can_purchase = kk_ai_can_purchase,
+    .purchase = kk_ai_purchase,
+    .is_anchor = G_AiIsStructure,
+};
+
+const AiGameInterface *G_AiInterface(void) { return &kk_ai_interface; }

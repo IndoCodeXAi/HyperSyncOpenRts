@@ -1,0 +1,29 @@
+#ifndef __MOBJ_DATA__
+#define __MOBJ_DATA__
+
+
+enum { DROPSHIP_MAX_PAYLOAD_TYPES = 5 };
+typedef struct { int type; int count; } DropshipPayload;
+
+typedef struct {
+    ivec2_t origin;
+    DropshipPayload payload[DROPSHIP_MAX_PAYLOAD_TYPES];
+    int payload_count;
+    int payload_index;
+    int released_count;
+} dc_drop_t;
+
+/* Game-owned object fields; vent indices refer to the active level. */
+#define MOBJ_GAME_FIELDS \
+    dc_drop_t drop; \
+    int resource_vent_index; \
+    uint32_t producer_id; \
+    int repair_wait; \
+    uint8_t ability_charge; /* Native object +0x0a, shared by special abilities. */
+
+#define MOBJ_GAME_CHECKSUM(HASH, actor) do { \
+    HASH((actor)->ability_charge); \
+    HASH((actor)->repair_wait); \
+} while (0)
+
+#endif

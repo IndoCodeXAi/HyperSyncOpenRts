@@ -1,0 +1,77 @@
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+/*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+/build
+/dist
+/android/.gradle/
+/android/.kotlin/
+/android/build/
+/android/app/build/
+/android/app/.cxx/
+/android/local.properties
+*.jks
+*.keystore
+data/
+/reverse/dc-exe-r2ghidra/
+/reverse/war2-exe-r2ghidra/
+/reverse/dr-hud/
+/reference/
+.DS_Store
+.claude/worktrees/
+.claude/projects/
+.claude/settings.local.json
+
+# Editor symbol indexes are generated locally, not tracked
+tags
+
+/reverse/7legion-placement/
+/reverse/z-ui/

@@ -1,0 +1,1676 @@
+#include "engine.h"
+#define _DEFAULT_SOURCE
+#include "info.h"
+
+static irect_t sprite_visible_bounds(const spritesheet_t *sprite, int frame);
+static irect_t sprite_frame_rect(const spritesheet_t *sprite, int frame);
+
+static int app_cell_w(const app_t *app) {
+    return app->cell.w > 0 ? app->cell.w : CELL_W;
+}
+
+static int app_cell_h(const app_t *app) {
+    return app->cell.h > 0 ? app->cell.h : CELL_H;
+}
+
+static void window_pixels(const app_t *app, int *w, int *h) {
+    *w = app && app->win.w > 0 ? app->win.w : SCREENWIDTH;
+    *h = app && app->win.h > 0 ? app->win.h : SCREENHEIGHT;
+    if (!app || !app->window) return;
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(app->window, &ww, &wh);
+    if (ww > 0 && wh > 0) { *w = ww; *h = wh; }
+}
+
+static int app_tile_w(const app_t *app, const tileset_t *tileset) {
+    (void)app;
+    return tileset->tile_w;
+}
+
+static int app_tile_h(const app_t *app, const tileset_t *tileset) {
+    (void)app;
+    return tileset->tile_h;
+}
+
+static int tileset_animate_value(const tileset_t *tileset, int value, uint32_t ticks_ms) {
+    if (!tileset->animations || tileset->animation_count <= 0) return value;
+    for (int i = 0; i < tileset->animation_count; ++i) {
+        const TileAnimation *anim = &tileset->animations[i];
+        if (anim->value != value) continue;
+        int frame = (int)((ticks_ms / anim->frame_ms) % (uint32_t)anim->frame_count);
+        return anim->frames[frame];
+    }
+    return value;
+}
+
+static int tileset_resolve_tile(const tileset_t *tileset, int value, uint32_t ticks_ms) {
+    value = tileset_animate_value(tileset, value, ticks_ms);
+    if (value < 0 || tileset->count <= 0) return -1;
+    if (tileset->tile_lookup) {
+        if (value < tileset->tile_lookup_count) {
+            int tile = tileset->tile_lookup[value];
+            if (tile >= 0 && tile < tileset->count) return tile;
+        }
+        return -1;
+    }
+    if (value < tileset->count) return value;
+    return value % tileset->count;
+}
+
+
+void R_GridToScreen(const app_t *app, float gx, float gy, float *sx, float *sy) {
+    *sx = gx * (float)app_cell_w(app) + app->cam.x;
+    *sy = gy * (float)app_cell_h(app) + app->cam.y;
+}
+
+void R_MapToScreen(const app_t *app, const level_t *map, float gx, float gy,
+                        float *sx, float *sy) {
+    float screen_y = L_ScreenYF(map, gy);
+    R_GridToScreen(app, gx, screen_y, sx, sy);
+}
+
+void R_MapPositionToScreen(const app_t *app, const level_t *map,
+                           fixed3_t position, float *sx, float *sy) {
+    fvec2_t planar = fixed3_xy_to_fvec2(position);
+    R_MapToScreen(app, map, planar.x, planar.y, sx, sy);
+    *sy -= fixed_to_float(position.z) * (float)app_cell_h(app);
+}
+
+static void screen_to_grid_point(const app_t *app, int sx, int sy, float *gx, float *gy) {
+    if (gx) *gx = ((float)sx - app->cam.x) / (float)app_cell_w(app);
+    if (gy) *gy = ((float)sy - app->cam.y) / (float)app_cell_h(app);
+}
+
+cell_t R_ScreenToGrid(const app_t *app, int sx, int sy) {
+    return (cell_t){ (int)floorf(((float)sx - app->cam.x) / (float)app_cell_w(app)),
+                   (int)floorf(((float)sy - app->cam.y) / (float)app_cell_h(app)) };
+}
+
+cell_t R_ScreenToMapGrid(const app_t *app, const level_t *map, int sx, int sy) {
+    float gx = 0.0f, gy = 0.0f;
+    screen_to_grid_point(app, sx, sy, &gx, &gy);
+    gy = L_WorldYF(map, gy);
+    return (cell_t){ (int)floorf(gx), (int)floorf(gy) };
+}
+
+static void screen_to_map_grid_point(const app_t *app, const level_t *map, int sx, int sy,
+                                     float *gx, float *gy) {
+    screen_to_grid_point(app, sx, sy, gx, gy);
+    if (gy) *gy = L_WorldYF(map, *gy);
+}
+
+void R_RefreshViewport(app_t *app) {
+#ifdef RTS_NATIVE_WORLD
+    if (!app || !app->window) return;
+    isize2_t size;
+    SDL_GetWindowSize(app->window, &size.w, &size.h);
+    V_AllocScreen(size.w, size.h);
+    if (screens[0].w == size.w && screens[0].h == size.h) app->win = size;
+#else
+    (void)app;
+#endif
+}
+
+void R_WindowToRenderPt(const app_t *app, int wx, int wy, int *rx, int *ry) {
+    int ww = 1, wh = 1;
+    window_pixels(app, &ww, &wh);
+    if (rx) *rx = wx * app->win.w / ww;
+    if (ry) *ry = wy * app->win.h / wh;
+}
+
+void R_WindowToRenderDelta(const app_t *app, int wx, int wy, float *rx, float *ry) {
+    int ww = 1, wh = 1;
+    window_pixels(app, &ww, &wh);
+    if (rx) *rx = (float)wx * (float)app->win.w / (float)ww;
+    if (ry) *ry = (float)wy * (float)app->win.h / (float)wh;
+}
+
+void R_DrawCell(app_t *app, int gx, int gy, uint32_t argb) {
+    float sx, sy;
+    R_GridToScreen(app, (float)gx, (float)gy, &sx, &sy);
+    irect_t r = { (int)sx, (int)sy, app_cell_w(app), app_cell_h(app) };
+    V_DrawRectOutline(r, V_NearestIndex(argb | 0xff000000u));
+}
+
+static void render_blocked_overlay(app_t *app, const level_t *map) {
+    if (!app || !map || !map->blocked) return;
+    int cell_w = app_cell_w(app);
+    int cell_h = app_cell_h(app);
+    uint8_t fill = V_NearestIndex(0xffe62d28u);
+    uint8_t edge = V_NearestIndex(0xffffcd40u);
+    for (int y = 0; y < map->height; ++y) {
+        for (int x = 0; x < map->width; ++x) {
+            if (!map->blocked[L_Index(map, x, y)]) continue;
+            float sx, sy;
+            R_GridToScreen(app, (float)x, L_CellScreenYF(map, y), &sx, &sy);
+            if (sx < -cell_w || sy < -cell_h ||
+                sx > app->win.w + cell_w || sy > app->win.h + cell_h) {
+                continue;
+            }
+            irect_t r = { (int)sx, (int)sy, cell_w, cell_h };
+            V_FillRect(r, fill);
+            V_DrawRectOutline(r, edge);
+        }
+    }
+}
+
+static void render_tile_at_flipped(app_t *app, const tileset_t *tileset, int tile,
+                                   irect_t src_part, irect_t dst_part, uint8_t transforms,
+                                   uint32_t draw_flags, const uint8_t *light) {
+    tile = tileset_resolve_tile(tileset, tile, app->ticks_ms);
+    if (tile < 0 || tile >= tileset->count || !tileset->indices) return;
+    uint32_t flags = draw_flags;
+    if (transforms & MAP_TILE_TRANSFORM_FLIP_X) flags |= V_FLIP_X;
+    if (transforms & MAP_TILE_TRANSFORM_FLIP_Y) flags |= V_FLIP_Y;
+    const tilepalettecycle_t *cycle = &tileset->palette_cycle;
+    bool live_palette = cycle->tiles && cycle->count > 1 && cycle->frame_ms && cycle->tiles[tile];
+    const uint32_t *palette = tileset->palette;
+    uint32_t colors[256];
+    if (live_palette) {
+        unsigned phase = (app->ticks_ms / cycle->frame_ms) % (unsigned)cycle->count;
+        memcpy(colors, palette, sizeof(colors));
+        for (int i = 0; i < cycle->count; ++i)
+            colors[cycle->indices[i]] = palette[cycle->indices[(i + (int)phase) % cycle->count]];
+        palette = colors;
+    }
+    isize2_t size = {tileset->tile_w, tileset->tile_h};
+    const uint8_t *indices = tileset->indices + (size_t)tile * (size_t)size.w * (size_t)size.h;
+    R_DrawIndexed(indices, size, palette, light, &src_part, &dst_part, flags);
+}
+
+void R_DrawTile(app_t *app, const tileset_t *tileset, int tile, irect_t src_part, irect_t dst_part) {
+    render_tile_at_flipped(app, tileset, tile, src_part, dst_part, 0, 0, NULL);
+}
+
+void R_SetLevelPalette(const tileset_t *tileset) {
+    if (!tileset) return;
+    for (int i = 0; i < 256; ++i) {
+        if (!tileset->palette[i]) continue;
+        I_SetPalette(tileset->palette);
+        return;
+    }
+}
+
+/* DC.EXE 0x40a7b3 passes night_weight*7>>8 to the terrain light buffer
+ * builder 0x44ee68, which ORs it into the low three bits of every light
+ * sample. The renderer then reads RMP row intensity*8+selector, so night
+ * shifts terrain colors without touching sprite team selectors. */
+static const uint8_t *terrain_light(const level_t *map, const tileset_t *tileset) {
+    if (!tileset->light_row_count) return NULL;
+    int level = map->daylight.weight * 7 >> 8;
+    if (level >= tileset->light_row_count) level = tileset->light_row_count - 1;
+    return tileset->light_rows[level < 0 ? 0 : level];
+}
+
+void R_DrawLevel(app_t *app, const level_t *map, const tileset_t *tileset) {
+    R_SetLevelPalette(tileset);
+    const uint8_t *light = terrain_light(map, tileset);
+    int cell_w = app_cell_w(app);
+    int cell_h = app_cell_h(app);
+    int tile_w = app_tile_w(app, tileset);
+    int tile_h = app_tile_h(app, tileset);
+    int draw_y_offset = tileset->draw_y_offset;
+    for (int y = 0; y < map->height; ++y) {
+        for (int x = 0; x < map->width; ++x) {
+            float sx, sy;
+            R_GridToScreen(app, (float)x, L_CellScreenYF(map, y), &sx, &sy);
+            if ((map->render_capabilities & MAP_RENDER_CAP_CELL_COLORS) && map->cell_colors) {
+                if (sx < -cell_w || sy < -cell_h ||
+                    sx > app->win.w + cell_w || sy > app->win.h + cell_h) {
+                    continue;
+                }
+                uint32_t color = map->cell_colors[L_Index(map, x, y)];
+                irect_t dst = { (int)sx, (int)sy, cell_w, cell_h };
+                V_FillRect(dst, V_NearestIndex(color | 0xff000000u));
+                continue;
+            }
+            if (sx < -tile_w || sy < -tile_h ||
+                sx > app->win.w + tile_w || sy > app->win.h + tile_h) {
+                continue;
+            }
+            int idx = L_Index(map, x, y);
+            int tile = map->tile_ids[idx];
+            if ((map->render_capabilities & MAP_RENDER_CAP_ZERO_TILE_EMPTY) && tile == 0) continue;
+            irect_t src = { 0, 0, tileset->tile_w, tileset->tile_h };
+            irect_t dst = {
+                (int)sx,
+                (int)(sy + draw_y_offset),
+                tile_w,
+                tile_h,
+            };
+            uint8_t base_flip =
+                (map->render_capabilities & MAP_RENDER_CAP_TILE_TRANSFORMS) &&
+                map->tile_transforms[0] ? map->tile_transforms[0][idx] : 0;
+            /* Ground tiles are opaque: index 0 is a colour unless the palette
+             * marks it transparent. */
+            render_tile_at_flipped(app, tileset, tile, src, dst, base_flip, V_OPAQUE, light);
+        }
+    }
+
+    for (int layer = 0;
+         !(map->render_capabilities & MAP_RENDER_CAP_DEPTH_SORTED_TILE_LAYERS) &&
+         layer < map->tile_overlay_count && layer < MAX_TILE_OVERLAYS;
+         ++layer) {
+        if (!map->tile_overlays[layer]) continue;
+        for (int y = 0; y < map->height; ++y) {
+            for (int x = 0; x < map->width; ++x) {
+                float sx, sy;
+                R_GridToScreen(app, (float)x, L_CellScreenYF(map, y), &sx, &sy);
+                if (sx < -tile_w || sy < -tile_h ||
+                    sx > app->win.w + tile_w || sy > app->win.h + tile_h) {
+                    continue;
+                }
+                int idx = L_Index(map, x, y);
+                int overlay = map->tile_overlays[layer][idx];
+                if (overlay <= 0) continue;
+                irect_t src = { 0, 0, tileset->tile_w, tileset->tile_h };
+                irect_t dst = {
+                    (int)sx,
+                    (int)(sy + draw_y_offset),
+                    tile_w,
+                    tile_h,
+                };
+                uint8_t overlay_flip =
+                    (map->render_capabilities & MAP_RENDER_CAP_TILE_TRANSFORMS) &&
+                    map->tile_transforms[layer + 1] ?
+                    map->tile_transforms[layer + 1][idx] : 0;
+                render_tile_at_flipped(app, tileset, overlay, src, dst, overlay_flip, 0, light);
+            }
+        }
+    }
+
+    if ((map->render_capabilities & MAP_RENDER_CAP_TERRAIN_TRANSITIONS) &&
+        !(map->render_capabilities & MAP_RENDER_CAP_CELL_COLORS) &&
+        map->render_transitions) {
+        for (int y = 0; y < map->height; ++y) {
+            for (int x = 0; x < map->width; ++x) {
+                float sx, sy;
+                R_GridToScreen(app, (float)x, L_CellScreenYF(map, y), &sx, &sy);
+                if (sx < -tile_w || sy < -tile_h ||
+                    sx > app->win.w + tile_w || sy > app->win.h + tile_h) {
+                    continue;
+                }
+                int dx = (int)sx;
+                int dy = (int)(sy + draw_y_offset);
+                map->render_transitions(app, map, tileset, x, y, dx, dy);
+            }
+        }
+    }
+
+    if (app->show_blocked) {
+        render_blocked_overlay(app, map);
+    }
+
+}
+
+void R_DrawGridOverlay(app_t *app, const level_t *map) {
+    if (!app || !map || !app->show_grid) return;
+
+    float left, bottom, right, top;
+    R_MapToScreen(app, map, 0.0f, 0.0f, &left, &bottom);
+    R_MapToScreen(app, map, (float)map->width, (float)map->height, &right, &top);
+
+    uint8_t grid = V_NearestIndex(0xffffffffu);
+    for (int x = 0; x <= map->width; ++x) {
+        float sx, unused;
+        R_MapToScreen(app, map, (float)x, 0.0f, &sx, &unused);
+        if (sx < 0.0f || sx > (float)app->win.w) continue;
+        V_DrawLine((ivec2_t){(int)lroundf(sx), (int)lroundf(top)},
+                   (ivec2_t){(int)lroundf(sx), (int)lroundf(bottom)}, grid);
+    }
+    for (int y = 0; y <= map->height; ++y) {
+        float unused, sy;
+        R_MapToScreen(app, map, 0.0f, (float)y, &unused, &sy);
+        if (sy < 0.0f || sy > (float)app->win.h) continue;
+        V_DrawLine((ivec2_t){(int)lroundf(left), (int)lroundf(sy)},
+                   (ivec2_t){(int)lroundf(right), (int)lroundf(sy)}, grid);
+    }
+}
+
+const spritesheet_t *R_CacheLookup(const spritecache_t *cache, const char *name) {
+    if (!cache || !name || name[0] == '\0') return NULL;
+    for (int i = 0; i < cache->count; ++i) {
+        if (strcasecmp(cache->entries[i].name, name) == 0)
+            return cache->entries[i].alias ? cache->entries[i].alias : &cache->entries[i].sprite;
+    }
+    return NULL;
+}
+
+cachedsprite_t *R_CacheFind(spritecache_t *cache, const char *name) {
+    if (!name || name[0] == '\0') return NULL;
+    for (int i = 0; i < cache->count; ++i) {
+        if (strcasecmp(cache->entries[i].name, name) == 0) return &cache->entries[i];
+    }
+    return NULL;
+}
+
+bool R_BindSprites(spritecache_t *cache, const gameinfo_t *game_info) {
+    int count = game_info->sprite_count;
+    const spritesheet_t **sprites = calloc((size_t)count, sizeof(*sprites));
+    if (!sprites) return false;
+    for (int i = 0; i < count; ++i)
+        sprites[i] = R_CacheLookup(cache, game_info->sprnames[i]);
+    free(cache->sprites);
+    cache->sprites = sprites;
+    cache->numsprites = count;
+    /* The sheets the unit types name for their turrets, by type ID. */
+    int types = game_info->mobj_type_count;
+    const spritesheet_t **turrets = calloc((size_t)(types > 0 ? types : 1), sizeof(*turrets));
+    if (!turrets) return false;
+    for (int i = 0; i < num_actor_types; ++i) {
+        const mobjtype_t *type = &actor_types[i];
+        if (type->turret.sprite_name && type->id < types)
+            turrets[type->id] = R_CacheLookup(cache, type->turret.sprite_name);
+    }
+    free(cache->turrets);
+    cache->turrets = turrets;
+    cache->numturrets = types;
+    return true;
+}
+
+const spritesheet_t *R_TurretSprite(const spritecache_t *cache, const mobj_t *u) {
+    if (!cache || !u || !u->info || !u->info->turret.sprite_name) return NULL;
+    if (cache->turrets && u->type_id < cache->numturrets && cache->turrets[u->type_id])
+        return cache->turrets[u->type_id];
+    return R_CacheLookup(cache, u->info->turret.sprite_name);
+}
+
+const spritesheet_t *R_StateSprite(const spritecache_t *cache, const gameinfo_t *game_info,
+                                   int sprite, const char *name) {
+    if (!cache) return NULL;
+    if (cache->sprites && sprite >= 0 && sprite < cache->numsprites)
+        return cache->sprites[sprite];
+    if (game_info && game_info->sprnames && sprite >= 0 && sprite < game_info->sprite_count)
+        name = game_info->sprnames[sprite];
+    return R_CacheLookup(cache, name);
+}
+
+bool R_AllocSpriteCells(spritesheet_t *sprite, int count) {
+    if (count <= 0) return false;
+    spritecell_t *cells = calloc((size_t)count, sizeof(*cells));
+    spritelump_t *lumps = calloc((size_t)count, sizeof(*lumps));
+    if (!cells || !lumps) {
+        free(cells);
+        free(lumps);
+        return false;
+    }
+    sprite->cells = cells;
+    sprite->lumps = lumps;
+    sprite->numlumps = count;
+    return true;
+}
+
+static void free_sprite_def(spritedef_t *def) {
+    for (int i = 0; i < def->numframes; ++i) {
+        spriteframe_t *frame = &def->spriteframes[i];
+        for (int r = 0; r < frame->rotations; ++r)
+            free(frame->directions[r].layers);
+        free(frame->directions);
+    }
+    free(def->spriteframes);
+    *def = (spritedef_t){0};
+}
+
+bool R_AllocSpriteDirections(spriteframe_t *frame, int rotations) {
+    if (!frame || rotations < frame->rotations || rotations < 1 ||
+        rotations > MAX_SPRITE_ROTATIONS) return false;
+    spritedirection_t *directions = realloc(frame->directions,
+        (size_t)rotations * sizeof(*directions));
+    if (!directions) return false;
+    memset(directions + frame->rotations, 0,
+           (size_t)(rotations - frame->rotations) * sizeof(*directions));
+    frame->directions = directions;
+    frame->rotations = rotations;
+    return true;
+}
+
+bool R_InitSpriteDef(spritesheet_t *sprite, int numframes, int rotations) {
+    if (!sprite || numframes <= 0 || rotations <= 0 ||
+        rotations > MAX_SPRITE_ROTATIONS) return false;
+    spriteframe_t *frames = calloc((size_t)numframes, sizeof(*frames));
+    if (!frames) return false;
+    for (int i = 0; i < numframes; ++i) {
+        if (!R_AllocSpriteDirections(&frames[i], rotations)) {
+            for (int j = 0; j < i; ++j) free(frames[j].directions);
+            free(frames);
+            return false;
+        }
+    }
+    free_sprite_def(&sprite->spritedef);
+    sprite->spritedef = (spritedef_t){
+        .numframes = numframes,
+        .spriteframes = frames,
+    };
+    return true;
+}
+
+bool R_InstallSpriteLump(spritesheet_t *sprite, int frame, int rotation,
+                         int lump, bool flip) {
+    if (!sprite || !sprite->spritedef.spriteframes || frame < 0 ||
+        frame >= sprite->spritedef.numframes || rotation < 0 ||
+        rotation >= sprite->spritedef.spriteframes[frame].rotations || lump < 0 ||
+        lump >= sprite->numlumps) return false;
+    spriteframe_t *spriteframe = &sprite->spritedef.spriteframes[frame];
+    spritedirection_t *direction = &spriteframe->directions[rotation];
+    spritelayer_t *layers = calloc(2, sizeof(*layers));
+    if (!layers) return false;
+    free(direction->layers);
+    direction->layers = layers;
+    snprintf(direction->layers[0].sprite_name,
+             sizeof(direction->layers[0].sprite_name), ".");
+    direction->layers[0].lump = lump;
+    direction->layers[0].intensity = 16;
+    direction->layers[0].flags = flip ? RTS_FRAME_FLIP_X : 0;
+    return true;
+}
+
+static int sprite_rotation_for_frame(const spritesheet_t *sprite, int frame,
+                                     angle_t angle) {
+    if (!sprite || frame < 0 || frame >= sprite->spritedef.numframes ||
+        !sprite->spritedef.spriteframes) return -1;
+    int rotations = sprite->spritedef.spriteframes[frame].rotations;
+    return angle_to_direction(angle, rotations, ANG90, false);
+}
+
+static const spritesheet_t *sprite_layer_source(const spritecache_t *cache,
+                                                const spritesheet_t *sprite,
+                                                const char *name) {
+    if (strcmp(name, ".") == 0) return sprite;
+    const spritesheet_t *source = R_CacheLookup(cache, name);
+    if (source) return source;
+    char path[32];
+    snprintf(path, sizeof(path), "SPRITES/%s.SPR", name);
+    return R_CacheLookup(cache, path);
+}
+
+static const spritelayer_t *sprite_body_part(const spritesheet_t *sprite, int frame,
+                                            int rotation) {
+    if (!sprite || !sprite->spritedef.spriteframes || frame < 0 ||
+        frame >= sprite->spritedef.numframes || rotation < 0 ||
+        rotation >= MAX_SPRITE_ROTATIONS) return NULL;
+    const spritelayer_t *parts =
+        sprite->spritedef.spriteframes[frame].directions[rotation].layers;
+    if (!parts) return NULL;
+    const spritelayer_t *fallback = NULL;
+    for (const spritelayer_t *part = parts; part->sprite_name[0] != '\0'; ++part) {
+        if (strcmp(part->sprite_name, ".") != 0) continue;
+        if (!fallback) fallback = part;
+        if (part->layer == 1) return part;
+    }
+    return fallback;
+}
+
+static int sprite_lump_for_frame(const spritesheet_t *sprite, int frame,
+                                 angle_t angle, bool *flip) {
+    if (flip) *flip = false;
+    int rotation = sprite_rotation_for_frame(sprite, frame, angle);
+    const spritelayer_t *part = sprite_body_part(sprite, frame, rotation);
+    if (!part) return -1;
+    if (flip) *flip = (part->flags & RTS_FRAME_FLIP_X) != 0;
+    return part->lump;
+}
+
+
+static int decoration_animation_step(const app_t *app, const mapdecoration_t *dec) {
+    int total_ms = 0;
+    for (int i = 0; i < dec->animation_frame_count; ++i)
+        total_ms += dec->animation_frames[i].duration_ms;
+    if (total_ms <= 0) return 0;
+
+    int elapsed_ms = (int)(app->ticks_ms % (uint32_t)total_ms);
+    for (int i = 0; i < dec->animation_frame_count; ++i) {
+        int duration_ms = dec->animation_frames[i].duration_ms;
+        if (elapsed_ms < duration_ms) return i;
+        elapsed_ms -= duration_ms;
+    }
+    return dec->animation_frame_count - 1;
+}
+
+static int decoration_sprite_frame(app_t *app, const mapdecoration_t *dec, const spritesheet_t *sprite,
+                                   int frame_index) {
+    if (frame_index >= sprite->numlumps) {
+        int lump = sprite_lump_for_frame(sprite, frame_index, dec->angle, NULL);
+        return lump >= 0 ? lump : 0;
+    }
+    if (frame_index >= 0) return frame_index;
+    if (frame_index < 0 && dec->animation_frame_count > 0) {
+        int step = decoration_animation_step(app, dec);
+        int authored_frame = dec->animation_frames[step].sprite_frame;
+        if (authored_frame >= 0 && authored_frame < sprite->numlumps) return authored_frame;
+    }
+    if (frame_index < 0) {
+        uint32_t frame_ms = dec->frame_interval_ms > 0 ?
+            (uint32_t)dec->frame_interval_ms : 250u;
+        return (int)((app->ticks_ms / frame_ms) % (uint32_t)sprite->numlumps);
+    }
+    return 0;
+}
+
+/* DC.EXE 0x45c7b0/0x45cc04 project the source silhouette; 0x45ba5a/
+ * 0x463bc0 repeat rows using an 8-bit accumulator and remap the destination. */
+bool R_RenderSpriteShadow(app_t *app, const spritesheet_t *sprite, int frame,
+                          irect_t ground_dst, uint32_t flags) {
+    if (!app || !sprite || !sprite->shadowmap || !sprite->lumps || !screens[0].pixels ||
+        frame < 0 || frame >= sprite->numlumps || !sprite->lumps[frame].indices)
+        return false;
+    if (gameinfo && gamesettings.detail < gameinfo->shadow_detail_min) return true;
+    irect_t source = sprite->cells[frame].rect;
+    if (source.w <= 0 || source.h <= 0) return false;
+    int height = source.h + source.h * 40 / 256;
+    int bottom = ground_dst.y + source.h;
+    int top = bottom - height;
+    int shear = (bottom < height ? bottom : height) >> 1;
+    bool flip = (flags & RTS_FRAME_FLIP_X) != 0;
+    int left = ground_dst.x - shear + (flip ? 1 : 0);
+    int source_y = top < 0 ? -top * 256 / 296 : 0;
+    int rows = top < 0 ? bottom : height;
+    if (top < 0) top = 0;
+    const uint8_t *indices = sprite->lumps[frame].indices;
+    unsigned stretch = 0;
+    bool repeated = false;
+    for (int row = 0; row < rows && source_y < source.h; ++row) {
+        int y = top + row;
+        int x_start = left + row / 2;
+        if (y >= 0 && y < screens[0].h) {
+            uint8_t *dst = screens[0].pixels + (size_t)y * (size_t)screens[0].w;
+            for (int x = 0; x < source.w; ++x) {
+                int dst_x = x_start + (flip ? source.w - 1 - x : x);
+                if (dst_x < 0 || dst_x >= screens[0].w) continue;
+                if (!indices[(size_t)source_y * (size_t)source.w + (size_t)x]) continue;
+                dst[dst_x] = sprite->shadowmap[dst[dst_x]];
+            }
+        }
+        if (!repeated) {
+            stretch += 40;
+            repeated = stretch >= 256;
+            stretch &= 255;
+            if (repeated) continue;
+        }
+        repeated = false;
+        ++source_y;
+    }
+    return true;
+}
+
+bool R_RenderIndexedBlend(app_t *app, const spritesheet_t *sprite, int frame,
+                          irect_t dst, uint32_t flags, int selector) {
+    (void)app;
+    if (!sprite || !sprite->indexed || !sprite->indexed_blend_table ||
+        selector != sprite->indexed_blend_selector || !sprite->lumps ||
+        frame < 0 || frame >= sprite->numlumps || !sprite->lumps[frame].indices)
+        return false;
+    if (gameinfo && gamesettings.detail < gameinfo->blend_detail_min) return true;
+    irect_t source = sprite->cells[frame].rect;
+    if (source.w <= 0 || source.h <= 0) return false;
+    uint32_t draw_flags = (flags & RTS_FRAME_FLIP_X) ? V_FLIP_X : 0;
+    V_DrawBlockTranslucent((ivec2_t){dst.x, dst.y}, sprite->lumps[frame].indices,
+                           (isize2_t){source.w, source.h}, source.w,
+                           sprite->indexed_blend_table, draw_flags);
+    return true;
+}
+
+/* FIN layer 3 is SDL_BLENDMODE_ADD of a color-modulated source. The table is
+ * dst = nearest(src * rgb/255 * alpha/255 + dst), cached per palette, team map
+ * and intensity. */
+static uint8_t *additive_table(const spritesheet_t *sprite, const uint8_t *team, int intensity) {
+    enum { TABLES = 16 };
+    static struct {
+        uint64_t key;
+        uint8_t table[65536];
+        bool used;
+    } cache[TABLES];
+    static int next;
+    if (intensity <= 0 || intensity > 16) intensity = 16;
+    /* Keyed on contents: the source palette is live and sheets are freed and reloaded. */
+    uint64_t key = 1469598103934665603ull ^ (uint64_t)intensity;
+    for (int i = 0; i < 256; ++i) {
+        key ^= (uint64_t)sprite->source_palette[i] | ((uint64_t)vpalette[i] << 32);
+        key *= 1099511628211ull;
+        key ^= team ? team[i] : (uint8_t)i;
+        key *= 1099511628211ull;
+    }
+    for (int i = 0; i < TABLES; ++i)
+        if (cache[i].used && cache[i].key == key) return cache[i].table;
+    int slot = next;
+    next = (next + 1) % TABLES;
+    int factor = (intensity * 255 + 8) / 16;
+    int cr = factor;
+    int cg = (factor * 236 + 127) / 255;
+    int cb = (factor * 72 + 127) / 255;
+    int alpha = 230;
+    uint8_t *table = cache[slot].table;
+    for (int src = 0; src < 256; ++src) {
+        uint8_t mapped = team ? team[src] : (uint8_t)src;
+        uint32_t color = sprite->source_palette[mapped];
+        int sr = ((int)((color >> 16) & 255) * cr / 255) * alpha / 255;
+        int sg = ((int)((color >> 8) & 255) * cg / 255) * alpha / 255;
+        int sb = ((int)(color & 255) * cb / 255) * alpha / 255;
+        for (int dst = 0; dst < 256; ++dst) {
+            int r = sr + (int)((vpalette[dst] >> 16) & 255);
+            int g = sg + (int)((vpalette[dst] >> 8) & 255);
+            int b = sb + (int)(vpalette[dst] & 255);
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+            table[(src << 8) | dst] = V_NearestIndex(0xff000000u | ((uint32_t)r << 16) |
+                                                     ((uint32_t)g << 8) | (uint32_t)b);
+        }
+    }
+    cache[slot].key = key;
+    cache[slot].used = true;
+    return table;
+}
+
+static SDL_Point sprite_frame_raw_displacement(const spritesheet_t *sprite, int frame);
+static SDL_Point sprite_ground_point(const spritesheet_t *sprite, int frame);
+
+static void render_decoration_sprite(app_t *app, const level_t *map,
+                                     const mapdecoration_t *dec, const spritesheet_t *sprite,
+                                     int frame_index, uint32_t render_flags,
+                                     int render_selector, int anchor_frame_index) {
+    if (!sprite || sprite->spritedef.numframes <= 0) return;
+
+    float sx, sy;
+    fvec2_t anchor = { (float)dec->cell.x, (float)dec->cell.y };
+    isize2_t footprint = {
+        dec->footprint.w > 0 ? dec->footprint.w : 1,
+        dec->footprint.h > 0 ? dec->footprint.h : 1,
+    };
+    R_MapToScreen(app, map, anchor.x, anchor.y, &sx, &sy);
+
+    int frame = decoration_sprite_frame(app, dec, sprite, frame_index);
+    int anchor_frame = decoration_sprite_frame(app, dec, sprite, anchor_frame_index);
+    irect_t frame_rect = sprite_frame_rect(sprite, frame);
+    int sprite_w = frame_rect.w;
+    int sprite_h = frame_rect.h;
+
+    irect_t dst;
+    if (dec->has_sprite_pivot) {
+        /* The plugin-authored point is in the full frame canvas, not in the
+           visible-pixel bounds.  All layers of a composite therefore attach
+           to exactly the same world point. */
+        if (dec->center_anchor) {
+            anchor = fvec2_add(anchor, fvec2_scale(
+                (fvec2_t){ (float)footprint.w, (float)footprint.h }, 0.5f));
+            R_MapToScreen(app, map, anchor.x, anchor.y, &sx, &sy);
+        }
+        ivec2_t pivot = dec->sprite_pivot;
+        if (frame_index < 0 && dec->animation_frame_count > 0)
+            pivot = dec->animation_frames[decoration_animation_step(app, dec)].sprite_pivot;
+        dst = (irect_t){
+            (int)lroundf(sx) - pivot.x,
+            (int)lroundf(sy) - pivot.y,
+            sprite_w,
+            sprite_h,
+        };
+    } else if (dec->center_anchor) {
+        anchor = fvec2_add(anchor, fvec2_scale(
+            (fvec2_t){ (float)footprint.w, (float)footprint.h }, 0.5f));
+        R_MapToScreen(app, map, anchor.x, anchor.y, &sx, &sy);
+        SDL_Point ground;
+        if (sprite->lumps) {
+            ground = sprite_ground_point(sprite, anchor_frame);
+        } else {
+            /* Preserve the legacy decoration anchor for formats without an
+               authored ground point (notably Dark Colony FIN sprites). */
+            irect_t anchor_rect = sprite_frame_rect(sprite, anchor_frame);
+            irect_t bounds = sprite_visible_bounds(sprite, anchor_frame);
+            ground = (SDL_Point){ anchor_rect.w / 2, bounds.y + bounds.h };
+        }
+        dst = (irect_t){
+            (int)(sx - ground.x),
+            (int)(sy - ground.y),
+            sprite_w,
+            sprite_h,
+        };
+        if (frame != anchor_frame) {
+            SDL_Point anchor_dis = sprite_frame_raw_displacement(sprite, anchor_frame);
+            SDL_Point frame_dis = sprite_frame_raw_displacement(sprite, frame);
+            dst.x += frame_dis.x - anchor_dis.x;
+            dst.y += frame_dis.y - anchor_dis.y;
+        }
+    } else {
+        dst = (irect_t){
+            (int)(sx + (float)(footprint.w * app_cell_w(app) - sprite_w) * 0.5f),
+            (int)(sy + (float)(footprint.h * app_cell_h(app) - sprite_h)),
+            sprite_w,
+            sprite_h,
+        };
+    }
+    if (dst.x > app->win.w || dst.y > app->win.h ||
+        dst.x + dst.w < 0 || dst.y + dst.h < 0) {
+        return;
+    }
+    if ((render_flags & RTS_FRAME_BLINK) != 0 && ((app->ticks_ms / 250u) % 2u) == 0u) {
+        return;
+    }
+    if (R_RenderIndexedBlend(app, sprite, frame, dst, render_flags, render_selector)) return;
+    uint32_t flip = (render_flags & RTS_FRAME_FLIP_X) ? V_FLIP_X : 0;
+    R_DrawSprite(sprite, frame, dec->render_remap, NULL, &dst, flip, 16);
+}
+
+static void render_decoration(app_t *app, const level_t *map,
+                              const mapdecoration_t *dec, const spritecache_t *cache) {
+    if (dec->hidden) return;
+    render_decoration_sprite(app, map, dec, R_CacheLookup(cache, dec->shadow_name),
+                             dec->frame_index, dec->render_flags, dec->render_selector,
+                             dec->frame_index);
+    render_decoration_sprite(app, map, dec, R_CacheLookup(cache, dec->sprite_name),
+                             dec->frame_index, dec->render_flags, dec->render_selector,
+                             dec->frame_index);
+    render_decoration_sprite(app, map, dec, R_CacheLookup(cache, dec->sprite2_name),
+                             dec->frame2_index, dec->render2_flags, dec->render2_selector,
+                             dec->frame_index);
+    render_decoration_sprite(app, map, dec, R_CacheLookup(cache, dec->sprite3_name),
+                             dec->frame3_index, dec->render3_flags, dec->render3_selector,
+                             dec->frame_index);
+}
+
+void R_DrawDecorations(app_t *app, const level_t *map, const spritecache_t *cache) {
+    for (int i = 0; i < map->decoration_count; ++i) {
+        render_decoration(app, map, &map->decorations[i], cache);
+    }
+}
+
+static float unit_pick_radius_px(const app_t *app, const mobj_t *unit) {
+    float cell = ((float)app_cell_w(app) + (float)app_cell_h(app)) * 0.5f;
+    float radius = fixed_to_float(P_MobjRadius(unit)) * cell;
+    float min_radius = 12.0f;
+    return radius < min_radius ? min_radius : radius;
+}
+
+static bool circle_intersects_rect(fvec2_t center, float radius, irect_t r) {
+    float nearest_x = center.x;
+    float nearest_y = center.y;
+    if (nearest_x < (float)r.x) nearest_x = (float)r.x;
+    if (nearest_x > (float)(r.x + r.w)) nearest_x = (float)(r.x + r.w);
+    if (nearest_y < (float)r.y) nearest_y = (float)r.y;
+    if (nearest_y > (float)(r.y + r.h)) nearest_y = (float)(r.y + r.h);
+    float dx = center.x - nearest_x;
+    float dy = center.y - nearest_y;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+static irect_t sprite_visible_bounds(const spritesheet_t *sprite, int frame) {
+    if (sprite && sprite->lumps && frame >= 0 && frame < sprite->numlumps) {
+        irect_t r = sprite->cells[frame].bounds;
+        if (r.w > 0 && r.h > 0) return r;
+    }
+    return (irect_t){ 0, 0,
+                      sprite ? sprite->frame_size.w : 1,
+                      sprite ? sprite->frame_size.h : 1 };
+}
+
+static irect_t sprite_frame_rect(const spritesheet_t *sprite, int frame) {
+    if (sprite && sprite->lumps && frame >= 0 && frame < sprite->numlumps &&
+        sprite->cells[frame].rect.w > 0 && sprite->cells[frame].rect.h > 0) {
+        return sprite->cells[frame].rect;
+    }
+    return (irect_t){ 0, 0,
+                      sprite ? sprite->frame_size.w : 1,
+                      sprite ? sprite->frame_size.h : 1 };
+}
+
+static SDL_Point sprite_frame_raw_displacement(const spritesheet_t *sprite, int frame) {
+    if (sprite && sprite->lumps && frame >= 0 && frame < sprite->numlumps) {
+        return (SDL_Point){ sprite->cells[frame].displacement.x,
+                            sprite->cells[frame].displacement.y };
+    }
+    return (SDL_Point){ 0, 0 };
+}
+
+
+static SDL_Point sprite_ground_point(const spritesheet_t *sprite, int frame) {
+    if (sprite && sprite->lumps && frame >= 0 && frame < sprite->numlumps) {
+        return (SDL_Point){ sprite->cells[frame].ground_point.x,
+                            sprite->cells[frame].ground_point.y };
+    }
+    irect_t bounds = sprite_visible_bounds(sprite, frame);
+    return (SDL_Point){ bounds.x + bounds.w / 2, bounds.y + bounds.h };
+}
+
+static const spritesheet_t *unit_sprite_sheet_for_view(const mobj_t *unit,
+                                                     const spritesheet_t *fallback_sprite,
+                                                     const spritecache_t *cache,
+                                                     const gameinfo_t *game_info) {
+    if (!unit) return NULL;
+    const spritesheet_t *sprite = R_StateSprite(cache, game_info,
+                                                unit->core.sprite_id, unit->core.sprite_name);
+    return sprite ? sprite : fallback_sprite;
+}
+
+static int unit_frame_for_view(const spritesheet_t *sprite, const mobj_t *unit,
+                               const gameinfo_t *game_info, uint32_t ticks,
+                               bool *flip) {
+    (void)ticks;
+    bool has_state_frames = game_info && game_info->states && game_info->state_count > 0;
+    int logical_frame = has_state_frames ? unit->core.frame : 0;
+    int lump = sprite_lump_for_frame(sprite, logical_frame, unit->core.angle, flip);
+    return lump >= 0 ? lump : 0;
+}
+
+static bool unit_screen_rect_for_view(const app_t *app, const level_t *map, const mobj_t *unit,
+                                      const spritesheet_t *fallback_sprite,
+                                      const spritecache_t *cache,
+                                      const gameinfo_t *game_info, uint32_t ticks,
+                                      irect_t *dst_out, irect_t *visible_out,
+                                      float *sx_out, float *sy_out,
+                                      int *frame_out, bool *flip_out,
+                                      const spritesheet_t **sprite_out) {
+    if (!app || !unit) return false;
+    float sx = 0.0f, sy = 0.0f;
+    R_MapPositionToScreen(app, map, unit->core.position, &sx, &sy);
+    const spritesheet_t *sprite = unit_sprite_sheet_for_view(unit, fallback_sprite, cache, game_info);
+    if (!sprite || !sprite->lumps || sprite->numlumps <= 0) {
+        float radius = unit_pick_radius_px(app, unit);
+        irect_t fallback = {
+            (int)floorf(sx - radius),
+            (int)floorf(sy - radius),
+            (int)ceilf(radius * 2.0f),
+            (int)ceilf(radius * 2.0f),
+        };
+        if (dst_out) *dst_out = fallback;
+        if (visible_out) *visible_out = fallback;
+        if (sx_out) *sx_out = sx;
+        if (sy_out) *sy_out = sy;
+        if (frame_out) *frame_out = 0;
+        if (sprite_out) *sprite_out = sprite;
+        return false;
+    }
+
+    bool frame_flip = false;
+    int frame = unit_frame_for_view(sprite, unit, game_info, ticks, &frame_flip);
+    irect_t frame_rect = sprite_frame_rect(sprite, frame);
+    irect_t bounds = sprite_visible_bounds(sprite, frame);
+    uint32_t render_flags = game_info ? unit->core.render_flags : 0;
+    if (frame_flip) render_flags ^= RTS_FRAME_FLIP_X;
+    if ((render_flags & RTS_FRAME_FLIP_X) != 0) {
+        bounds.x = frame_rect.w - bounds.x - bounds.w;
+    }
+    int sprite_w = frame_rect.w;
+    int sprite_h = frame_rect.h;
+    int body_offset_x = 0;
+    int body_offset_y = 0;
+    irect_t dst;
+    if (game_info && game_info->state_coord_mode == RTS_STATE_COORDS_FIN_TOP_LEFT) {
+        SDL_Point pivot = sprite_ground_point(sprite, frame);
+        if ((render_flags & RTS_FRAME_FLIP_X) != 0)
+            pivot.x = frame_rect.w - pivot.x;
+        dst = (irect_t){
+            (int)lroundf(sx) + body_offset_x - pivot.x,
+            (int)lroundf(sy) + body_offset_y - pivot.y,
+            sprite_w,
+            sprite_h,
+        };
+    } else {
+        SDL_Point ground = sprite_ground_point(sprite, frame);
+        if ((render_flags & RTS_FRAME_FLIP_X) != 0) {
+            ground.x = frame_rect.w - ground.x;
+        }
+        dst = (irect_t){
+            (int)lroundf(sx - (float)ground.x) + body_offset_x,
+            (int)lroundf(sy - (float)ground.y) + body_offset_y,
+            sprite_w,
+            sprite_h,
+        };
+    }
+    dst.x += unit->core.render_offset.x;
+    dst.y += L_ScreenDY(unit->core.render_offset.y);
+    irect_t visible = {
+        dst.x + bounds.x,
+        dst.y + bounds.y,
+        bounds.w,
+        bounds.h,
+    };
+    if (dst_out) *dst_out = dst;
+    if (visible_out) *visible_out = visible;
+    if (sx_out) *sx_out = sx;
+    if (sy_out) *sy_out = sy;
+    if (frame_out) *frame_out = frame;
+    if (flip_out) *flip_out = (render_flags & RTS_FRAME_FLIP_X) != 0;
+    if (sprite_out) *sprite_out = sprite;
+    return true;
+}
+
+int R_PickUnit(const app_t *app, const level_t *map, mobj_t *const *units, int unit_count,
+                        const spritesheet_t *fallback_sprite, const spritecache_t *cache,
+                        const gameinfo_t *game_info, int x, int y, int owner_filter) {
+    int best = -1;
+    float best_score = 1000000000.0f;
+    for (int i = unit_count - 1; i >= 0; --i) {
+        const mobj_t *unit = units[i];
+        if (!P_VisibleToPlayer(unit) || unit->hp <= 0 ||
+            (unit->traits & MF_SELECTABLE) == 0) continue;
+        if (owner_filter >= 0 && unit->owner != owner_filter) continue;
+        irect_t visible;
+        float sx = 0.0f, sy = 0.0f;
+        unit_screen_rect_for_view(app, map, unit, fallback_sprite, cache, game_info, app->ticks_ms,
+                                  NULL, &visible, &sx, &sy, NULL, NULL, NULL);
+        if (!irect_contains(visible, (ivec2_t){ x, y })) continue;
+        float dx = (float)x - sx;
+        float dy = (float)y - sy;
+        float score = dx * dx + dy * dy;
+        if (score >= best_score) continue;
+        best_score = score;
+        best = i;
+    }
+    return best;
+}
+
+static int selection_health_bucket(const mobj_t *u) {
+    if (!u || u->max_hp <= 0) return 0;
+    if (u->hp * 3 <= u->max_hp) return 2;
+    if (u->hp * 3 <= u->max_hp * 2) return 1;
+    return 0;
+}
+
+static uint8_t selection_health_tint(int bucket) {
+    switch (bucket) {
+    case 2: return V_NearestIndex(0xffff4c36u);
+    case 1: return V_NearestIndex(0xffffda3eu);
+    default: return V_NearestIndex(0xff53f55cu);
+    }
+}
+
+static void draw_selection_brackets(app_t *app, const mobj_t *u, const irect_t *visible) {
+    if (!app || !u || !visible || visible->w <= 0 || visible->h <= 0) return;
+    irect_t box = {
+        visible->x - 3,
+        visible->y - 3,
+        visible->w + 6,
+        visible->h + 6,
+    };
+    int corner = box.w < box.h ? box.w / 4 : box.h / 4;
+    if (corner < 4) corner = 4;
+    if (corner > 9) corner = 9;
+    int right = box.x + box.w - 1;
+    int bottom = box.y + box.h - 1;
+    uint8_t ink = V_NearestIndex(0xffececdc);
+    V_DrawLine((ivec2_t){box.x, box.y}, (ivec2_t){box.x + corner, box.y}, ink);
+    V_DrawLine((ivec2_t){box.x, box.y}, (ivec2_t){box.x, box.y + corner}, ink);
+    V_DrawLine((ivec2_t){right - corner, box.y}, (ivec2_t){right, box.y}, ink);
+    V_DrawLine((ivec2_t){right, box.y}, (ivec2_t){right, box.y + corner}, ink);
+    V_DrawLine((ivec2_t){box.x, bottom - corner}, (ivec2_t){box.x, bottom}, ink);
+    V_DrawLine((ivec2_t){box.x, bottom}, (ivec2_t){box.x + corner, bottom}, ink);
+    V_DrawLine((ivec2_t){right, bottom - corner}, (ivec2_t){right, bottom}, ink);
+    V_DrawLine((ivec2_t){right - corner, bottom}, (ivec2_t){right, bottom}, ink);
+
+    int bar_w = box.w - 8;
+    if (bar_w < 16) bar_w = 16;
+    int bar_x = box.x + (box.w - bar_w) / 2;
+    int bar_y = box.y - 5;
+    int fill_w = u->max_hp > 0 ? (bar_w * u->hp) / u->max_hp : bar_w;
+    uint8_t tint = selection_health_tint(selection_health_bucket(u));
+    V_FillRect((irect_t){ bar_x - 1, bar_y - 1, bar_w + 2, 4 }, V_NearestIndex(0xff141412u));
+    V_FillRect((irect_t){ bar_x, bar_y, fill_w, 2 }, tint);
+}
+
+/* A mobj's own remap, or its team's palette where the game keeps one. */
+static int mobj_remap(const mobj_t *mobj, const gameinfo_t *game_info) {
+    if (!mobj->core.render_remap && game_info && game_info->team_palettes) return mobj->team;
+    return mobj->core.render_remap;
+}
+
+static void render_centered_mobj(app_t *app, const level_t *map, const mobj_t *mobj,
+                                const spritecache_t *cache, const gameinfo_t *game_info);
+
+/* Where a frame's layers go: ground-offset games place them on the canvas
+ * drawn at `dst`, the others stand them on the ground point `ground` on
+ * screen (a sheet of layers alone has no canvas of its own). */
+static ivec2_t layer_origin(const gameinfo_t *game_info, irect_t dst, ivec2_t ground) {
+    return game_info && game_info->state_coord_mode == RTS_STATE_COORDS_GROUND_OFFSET ?
+        (ivec2_t){dst.x, dst.y} : ground;
+}
+
+/* A frame's layers at `origin` (see layer_origin): on the canvas, or each
+ * with its bottom edge on the ground point. */
+static void draw_sprite_layers(app_t *app, const mobj_t *u, const spritesheet_t *sprite,
+                               const spritelayer_t *parts, ivec2_t origin,
+                               const spritecache_t *cache, const gameinfo_t *game_info) {
+    bool on_canvas = game_info && game_info->state_coord_mode == RTS_STATE_COORDS_GROUND_OFFSET;
+    for (const spritelayer_t *part = parts; part->sprite_name[0] != '\0'; ++part) {
+        const spritesheet_t *source = sprite_layer_source(
+            cache, sprite, part->sprite_name);
+        if (!source || !source->lumps || part->lump >= source->numlumps)
+            continue;
+        irect_t source_rect = sprite_frame_rect(source, part->lump);
+        SDL_Point displacement = sprite_frame_raw_displacement(source, part->lump);
+        uint32_t part_flags = part->flags;
+        irect_t part_dst = {
+            origin.x + part->offset.x + ((part_flags & RTS_FRAME_FLIP_X) ? 0 : displacement.x),
+            origin.y + part->offset.y - (on_canvas ? 0 : source_rect.h),
+            source_rect.w,
+            source_rect.h,
+        };
+        if (part->layer == 1 || part->layer == 2) {
+            irect_t ground_dst = part_dst;
+            ground_dst.y += (int)lroundf(fixed_to_float(u->core.position.z) * app_cell_h(app));
+            R_RenderSpriteShadow(app, source, part->lump, ground_dst, part_flags);
+        }
+        if (source->shadowmap && part->layer == 2) continue;
+        if (R_RenderIndexedBlend(app, source, part->lump, part_dst,
+                                 part_flags, part->layer)) continue;
+        /* DC.EXE queues object team color separately from FIN remap,
+         * which selects a clipping path, not a palette translation. */
+        int translation = level.player_teams && u->team < 8 ? level.player_colors[u->team] : u->team;
+        uint32_t part_flip = (part_flags & RTS_FRAME_FLIP_X) ? V_FLIP_X : 0;
+        if (part->layer == 3) {
+            const uint8_t *team = R_PaletteMap(source, translation);
+            const uint8_t *table = additive_table(source, team, part->intensity);
+            V_DrawBlockTranslucent((ivec2_t){part_dst.x, part_dst.y},
+                                   source->lumps[part->lump].indices,
+                                   (isize2_t){source_rect.w, source_rect.h}, source_rect.w,
+                                   table, part_flip);
+            continue;
+        }
+        R_DrawSprite(source, part->lump, translation, NULL, &part_dst, part_flip, part->intensity);
+    }
+}
+
+/* A turret over its hull picture `hull_lump` drawn at `hull_dst`: its own
+ * sheet turned by the unit's aim, its ground point on the hull's mount
+ * point. Attacking, it shows its fire frame plus as far as the body has
+ * gone into its attack run, where the sheet has that frame. */
+static void draw_turret(app_t *app, const mobj_t *u, const spritesheet_t *hull, int hull_lump,
+                        irect_t hull_dst, bool hull_flip,
+                        const spritecache_t *cache, const gameinfo_t *game_info) {
+    const spritesheet_t *turret = R_TurretSprite(cache, u);
+    if (!turret || !turret->lumps || turret->spritedef.numframes <= 0 || !hull->lumps ||
+        hull_lump < 0 || hull_lump >= hull->numlumps || !game_info || !game_info->states) return;
+    int frame = u->info->turret.frame;
+    const state_t *state = u->core.state_id >= 0 && u->core.state_id < game_info->state_count ?
+        &game_info->states[u->core.state_id] : NULL;
+    if (state && state->group == 3 && u->info->turret.fire_frame >= 0 &&
+        u->type_id < game_info->mobj_type_count) {
+        int attack = game_info->mobjinfo[u->type_id].missilestate;
+        int run = attack > 0 && attack < game_info->state_count ? game_info->states[attack].frame : 0;
+        int firing = u->info->turret.fire_frame + u->core.frame - run;
+        if (firing >= 0 && firing < turret->spritedef.numframes) frame = firing;
+    }
+    angle_t aim = u->core.angle + u->attack.aim;
+    bool flip = false;
+    int lump = sprite_lump_for_frame(turret, frame, aim, &flip);
+    int rotation = sprite_rotation_for_frame(turret, frame, aim);
+    if (lump < 0 || rotation < 0) return;
+    ivec2_t mount = hull->cells[hull_lump].mount;
+    if (hull_flip) mount.x = sprite_frame_rect(hull, hull_lump).w - mount.x;
+    irect_t rect = sprite_frame_rect(turret, lump);
+    SDL_Point ground = sprite_ground_point(turret, lump);
+    if (flip) ground.x = rect.w - ground.x;
+    ivec2_t at = {hull_dst.x + mount.x, hull_dst.y + mount.y}; /* the mount on screen */
+    irect_t dst = {at.x - ground.x, at.y - ground.y, rect.w, rect.h};
+    const spritelayer_t *parts = turret->spritedef.spriteframes[frame].directions[rotation].layers;
+    if (parts) {
+        draw_sprite_layers(app, u, turret, parts, layer_origin(game_info, dst, at), cache, game_info);
+        return;
+    }
+    R_DrawSprite(turret, lump, mobj_remap(u, game_info), NULL, &dst, flip ? V_FLIP_X : 0,
+                 u->core.render_intensity);
+}
+
+static void draw_unit_sprite(app_t *app, const level_t *map,
+                               const mobj_t *u, const spritesheet_t *fallback_sprite,
+                               const spritecache_t *cache, const gameinfo_t *game_info,
+                               uint32_t ticks) {
+    if (!u || (u->traits & MF_RENDERABLE) == 0) return;
+    if ((u->traits & MF_NOBLOCKMAP) &&
+        (!game_info || game_info->state_coord_mode != RTS_STATE_COORDS_FIN_TOP_LEFT)) {
+        render_centered_mobj(app, map, u, cache, game_info);
+        return;
+    }
+    const spritesheet_t *sprite = unit_sprite_sheet_for_view(u, fallback_sprite, cache, game_info);
+    if (!sprite || sprite->spritedef.numframes <= 0) return;
+
+    float sx = 0.0f, sy = 0.0f;
+    int frame = 0;
+    bool frame_flip = false;
+    irect_t dst;
+    irect_t visible;
+    unit_screen_rect_for_view(app, map, u, fallback_sprite, cache, game_info, ticks,
+                              &dst, &visible, &sx, &sy, &frame, &frame_flip, &sprite);
+    uint32_t render_flags = game_info ? u->core.render_flags : 0;
+    if (frame_flip) render_flags |= RTS_FRAME_FLIP_X;
+    const spritesheet_t *shadow = R_CacheLookup(
+        cache, u->info && u->info->shadow_name ? u->info->shadow_name : "");
+    /* Some Dark Reign unit definitions repeat the body RSPR in
+       SetShadowImage.  The original treats its shadow data specially; our
+       cache resolves that name to the already-loaded colour body sheet, so
+       drawing it here would create a second vehicle that mirrors every move. */
+    if (shadow && shadow != sprite && shadow->lumps && shadow->numlumps > 0) {
+        int shadow_frame = frame < shadow->numlumps ? frame : 0;
+        irect_t shadow_rect = sprite_frame_rect(shadow, shadow_frame);
+        irect_t shadow_dst = { dst.x, dst.y, shadow_rect.w, shadow_rect.h };
+        R_DrawSprite(shadow, shadow_frame, -1, NULL, &shadow_dst, 0, 16);
+    }
+    int logical_frame = game_info && game_info->states && game_info->state_count > 0 ?
+        u->core.frame : 0;
+    int rotation = sprite_rotation_for_frame(sprite, logical_frame, u->core.angle);
+    const spriteframe_t *spriteframe = rotation >= 0 ?
+        &sprite->spritedef.spriteframes[logical_frame] : NULL;
+    const spritelayer_t *parts = spriteframe ?
+        spriteframe->directions[rotation].layers : NULL;
+    if (parts) {
+        ivec2_t ground = {(int)lroundf(sx) + u->core.render_offset.x,
+                          (int)lroundf(sy) + L_ScreenDY(u->core.render_offset.y)};
+        draw_sprite_layers(app, u, sprite, parts, layer_origin(game_info, dst, ground), cache, game_info);
+    } else {
+    uint32_t flip = (render_flags & RTS_FRAME_FLIP_X) ? V_FLIP_X : 0;
+    R_DrawSprite(sprite, frame, mobj_remap(u, game_info), NULL, &dst,
+                 flip, u->core.render_intensity);
+    }
+    /* Only the unit's own living pictures, its spawn state's sheet, carry
+     * the turret. */
+    if (u->info && u->info->turret.sprite_name && u->hp > 0 && game_info && game_info->states &&
+        u->type_id < game_info->mobj_type_count &&
+        sprite == R_StateSprite(cache, game_info,
+                                game_info->states[game_info->mobjinfo[u->type_id].spawnstate].sprite, NULL))
+        draw_turret(app, u, sprite, frame, dst, (render_flags & RTS_FRAME_FLIP_X) != 0, cache, game_info);
+    if (game_info && (game_info->draw_underlays || game_info->draw_overlays)) return;
+    bool selected = P_MobjIsSelected(u) && (u->traits & MF_SELECTABLE);
+    if (selected) {
+        if (game_info && game_info->selection_marker.style == SELECTION_STYLE_BRACKETS) {
+            draw_selection_brackets(app, u, &visible);
+            return;
+        }
+        V_DrawRectOutline(visible, V_NearestIndex(0xff53f55cu));
+    }
+    if (u->max_hp > 0 && u->hp > 0 && (selected || u->hp < u->max_hp)) {
+        int bar_w = visible.w;
+        int bar_h = 2;
+        int bx = visible.x;
+        int by = visible.y - bar_h - 4;
+        int hp = u->hp < u->max_hp ? u->hp : u->max_hp;
+        irect_t back = { bx - 1, by - 1, bar_w + 2, bar_h + 2 };
+        irect_t fill = { bx, by, (int)((int64_t)bar_w * hp / u->max_hp), bar_h };
+        V_FillRect(back, V_NearestIndex(0xff141412u));
+        V_FillRect(fill, selection_health_tint(selection_health_bucket(u)));
+    }
+}
+
+static void render_unit_sprite(app_t *app, const level_t *map,
+                               const mobj_t *unit, const spritesheet_t *fallback,
+                               const spritecache_t *cache, const gameinfo_t *info, uint32_t ticks) {
+    if (P_VisibleToPlayer(unit)) draw_unit_sprite(app, map, unit, fallback, cache, info, ticks);
+}
+
+void R_DrawBuildingPreview(app_t *app, uint16_t type, ivec2_t cell, int team,
+                           const spritecache_t *cache) {
+    const mobjtype_t *info = P_ActorType(type);
+    if (!info || type >= gameinfo->mobj_type_count) return;
+    int state_id = gameinfo->mobjinfo[type].spawnstate;
+    if (state_id <= 0 || state_id >= gameinfo->state_count) return;
+    const state_t *state = &gameinfo->states[state_id];
+    /* An unlinked presentation value: no thinker, state action or game ID. */
+    mobj_t image = {.type_id = type, .info = info, .traits = MF_RENDERABLE, .team = team,
+        .core = {.position = fixed3_from_fixed2(P_BuildingPosition(type, cell), 0),
+                 .angle = ANG270, .state_id = state_id, .sprite_id = state->sprite,
+                 .frame = state->frame, .render_intensity = 16}};
+    snprintf(image.core.sprite_name, sizeof(image.core.sprite_name), "%s", info->sprite_name);
+    draw_unit_sprite(app, &level, &image, NULL, cache, gameinfo, 0);
+}
+
+static void render_unit_overlays(app_t *app, const level_t *map, mobj_t *const *units,
+                                 int unit_count, const spritecache_t *cache,
+                                 const gameinfo_t *game_info, unitoverlaydrawf_t draw) {
+    if (!game_info || !draw) return;
+    for (int i = 0; i < unit_count; ++i) {
+        const mobj_t *unit = units[i];
+        if (!unit || !P_VisibleToPlayer(unit) || !(unit->traits & MF_RENDERABLE)) continue;
+        unitoverlaycontext_t ctx = {
+            .app = app, .unit = unit, .cache = cache,
+            .game_info = game_info,
+        };
+        R_MapPositionToScreen(app, map, unit->core.position, &ctx.anchor.x, &ctx.anchor.y);
+        unit_screen_rect_for_view(app, map, unit, NULL, cache, game_info, 0,
+                                  NULL, &ctx.bounds, NULL, NULL, NULL, NULL, NULL);
+        draw(&ctx);
+    }
+}
+
+void R_DrawThings(app_t *app, mobj_t *const *units, int unit_count, const spritesheet_t *fallback_sprite,
+                  const spritecache_t *cache, const gameinfo_t *game_info, uint32_t ticks) {
+    render_unit_overlays(app, &level, units, unit_count, cache, game_info,
+                         game_info ? game_info->draw_underlays : NULL);
+    for (int i = 0; i < unit_count; ++i)
+        render_unit_sprite(app, &level, units[i], fallback_sprite, cache, game_info, ticks);
+    render_unit_overlays(app, &level, units, unit_count, cache, game_info,
+                         game_info ? game_info->draw_overlays : NULL);
+}
+
+static int compare_draw_commands(const void *a, const void *b) {
+    const drawcommand_t *ia = a;
+    const drawcommand_t *ib = b;
+    /* Elevated objects cover ground objects regardless of their ground Y. */
+    if (ia->sort_z < ib->sort_z) return -1;
+    if (ia->sort_z > ib->sort_z) return 1;
+    if (ia->sort_y < ib->sort_y) return -1;
+    if (ia->sort_y > ib->sort_y) return 1;
+    if (ia->layer != ib->layer) return (int)ia->layer - (int)ib->layer;
+    if (ia->kind != ib->kind) return (int)ia->kind - (int)ib->kind;
+    return ia->stable_index - ib->stable_index;
+}
+
+static void render_overlay_tile_item(app_t *app, const level_t *map, const tileset_t *tileset,
+                                     int x, int y, int layer) {
+    if (!app || !map || !tileset || layer < 0 || layer >= map->tile_overlay_count ||
+        layer >= MAX_TILE_OVERLAYS || !map->tile_overlays[layer]) {
+        return;
+    }
+    int idx = L_Index(map, x, y);
+    int overlay = map->tile_overlays[layer][idx];
+    if (overlay <= 0) return;
+
+    int tile_w = app_tile_w(app, tileset);
+    int tile_h = app_tile_h(app, tileset);
+    int draw_y_offset = tileset->draw_y_offset;
+    float sx, sy;
+    R_GridToScreen(app, (float)x, L_CellScreenYF(map, y), &sx, &sy);
+    if (sx < -tile_w || sy < -tile_h ||
+        sx > app->win.w + tile_w || sy > app->win.h + tile_h) {
+        return;
+    }
+    irect_t src = { 0, 0, tileset->tile_w, tileset->tile_h };
+    irect_t dst = {
+        (int)sx,
+        (int)(sy + draw_y_offset),
+        tile_w,
+        tile_h,
+    };
+    uint8_t overlay_flip =
+        (map->render_capabilities & MAP_RENDER_CAP_TILE_TRANSFORMS) &&
+        map->tile_transforms[layer + 1] ? map->tile_transforms[layer + 1][idx] : 0;
+    render_tile_at_flipped(app, tileset, overlay, src, dst, overlay_flip, 0,
+                           terrain_light(map, tileset));
+}
+
+void R_RenderPlayerView(app_t *app, const level_t *map, const tileset_t *tileset,
+                          mobj_t *const *units, int unit_count, const spritesheet_t *fallback_sprite,
+                          const spritecache_t *cache, const gameinfo_t *game_info, uint32_t ticks) {
+    if (!app || !map) return;
+    render_unit_overlays(app, map, units, unit_count, cache, game_info,
+                         game_info ? game_info->draw_underlays : NULL);
+    int overlay_count = 0;
+    if (map->render_capabilities & MAP_RENDER_CAP_DEPTH_SORTED_TILE_LAYERS) {
+        for (int layer = 0; layer < map->tile_overlay_count && layer < MAX_TILE_OVERLAYS; ++layer) {
+            if (!map->tile_overlays[layer]) continue;
+            for (int y = 0; y < map->height; ++y) {
+                for (int x = 0; x < map->width; ++x) {
+                    if (map->tile_overlays[layer][L_Index(map, x, y)] > 0) overlay_count++;
+                }
+            }
+        }
+    }
+
+    int decoration_count = map->decoration_count > 0 ? map->decoration_count : 0;
+    int total = overlay_count + decoration_count + (unit_count > 0 ? unit_count : 0);
+    if (total <= 0) return;
+    drawcommand_t *commands = malloc((size_t)total * sizeof(*commands));
+    if (!commands) {
+        R_DrawDecorations(app, map, cache);
+        for (int i = 0; i < unit_count; ++i) {
+            render_unit_sprite(app, map, units[i], fallback_sprite, cache, game_info, ticks);
+        }
+        render_unit_overlays(app, map, units, unit_count, cache, game_info,
+                             game_info ? game_info->draw_overlays : NULL);
+        return;
+    }
+
+    int count = 0;
+    if (map->render_capabilities & MAP_RENDER_CAP_DEPTH_SORTED_TILE_LAYERS) {
+        for (int layer = 0; layer < map->tile_overlay_count && layer < MAX_TILE_OVERLAYS; ++layer) {
+            if (!map->tile_overlays[layer]) continue;
+            for (int y = 0; y < map->height; ++y) {
+                for (int x = 0; x < map->width; ++x) {
+                    if (map->tile_overlays[layer][L_Index(map, x, y)] <= 0) continue;
+                    commands[count++] = (drawcommand_t){
+                        .kind = DRAW_COMMAND_TILE_OVERLAY,
+                        .layer = RENDER_LAYER_TERRAIN_OVERLAY,
+                        .sort_y = L_CellScreenYF(map, y) + 1.0f + (float)layer * 0.001f,
+                        .stable_index = L_Index(map, x, y),
+                        .ref.tile_overlay = { .x = x, .y = y, .layer = layer },
+                    };
+                }
+            }
+        }
+    }
+    for (int i = 0; i < map->decoration_count; ++i) {
+        const mapdecoration_t *dec = &map->decorations[i];
+        int footprint_height = dec->footprint.h > 0 ? dec->footprint.h : 1;
+        float sort_y;
+        if (!dec->solid) {
+            /* Passable ground stamps (Taelon/water pits, rubble) stay under
+               units standing on them. OpenDR draws resource sprites at
+               ZOffset -8196. */
+            sort_y = (float)dec->cell.y;
+        } else {
+            sort_y = dec->has_sprite_pivot ?
+                (float)dec->cell.y + (float)footprint_height :
+                dec->center_anchor ?
+                (float)dec->cell.y + 0.5f :
+                (float)dec->cell.y + (float)footprint_height;
+        }
+        sort_y = L_ScreenYF(map, sort_y);
+        commands[count++] = (drawcommand_t){
+            .kind = DRAW_COMMAND_DECORATION,
+            .layer = RENDER_LAYER_DECORATION,
+            .sort_y = sort_y,
+            .stable_index = i,
+            .ref.decoration = dec,
+        };
+    }
+    for (int i = 0; i < unit_count; ++i) {
+        if (!P_VisibleToPlayer(units[i])) continue;
+        fvec2_t position = fixed3_xy_to_fvec2(units[i]->core.position);
+        commands[count++] = (drawcommand_t){
+            .kind = DRAW_COMMAND_UNIT,
+            .layer = RENDER_LAYER_UNIT,
+            .sort_z = units[i]->core.position.z,
+            .sort_y = L_ScreenYF(map, position.y),
+            .stable_index = i,
+            .ref.unit = units[i],
+        };
+    }
+
+    qsort(commands, (size_t)count, sizeof(*commands), compare_draw_commands);
+    for (int i = 0; i < count; ++i) {
+        drawcommand_t *command = &commands[i];
+        if (command->kind == DRAW_COMMAND_TILE_OVERLAY) {
+            render_overlay_tile_item(app, map, tileset, command->ref.tile_overlay.x,
+                                     command->ref.tile_overlay.y, command->ref.tile_overlay.layer);
+        } else if (command->kind == DRAW_COMMAND_DECORATION) {
+            render_decoration(app, map, command->ref.decoration, cache);
+        } else {
+            render_unit_sprite(app, map, command->ref.unit, fallback_sprite, cache, game_info, ticks);
+        }
+    }
+    free(commands);
+    render_unit_overlays(app, map, units, unit_count, cache, game_info,
+                         game_info ? game_info->draw_overlays : NULL);
+}
+
+static void render_centered_mobj(app_t *app, const level_t *map, const mobj_t *effect,
+                                const spritecache_t *cache, const gameinfo_t *game_info) {
+    int i = (int)effect->id;
+    const spritesheet_t *sprite = R_StateSprite(cache, game_info,
+                                                (effect->core.state_id > 0) ? effect->core.sprite_id : -1, effect->core.sprite_name);
+    if (!sprite || !sprite->lumps || sprite->numlumps <= 0) {
+        debug_effects_log("render skip slot=%d sprite=%s reason=missing-cache",
+                          i, effect->core.sprite_name);
+        return;
+    }
+
+    float sx, sy;
+    fvec2_t position = fixed3_xy_to_fvec2(effect->core.position);
+    R_MapPositionToScreen(app, map, effect->core.position, &sx, &sy);
+    int frame = sprite_lump_for_frame(sprite, effect->core.frame, effect->core.angle, NULL);
+    if (frame < 0 || frame >= sprite->numlumps) frame = 0;
+    irect_t frame_rect = sprite_frame_rect(sprite, frame);
+    int sprite_w = frame_rect.w;
+    int sprite_h = frame_rect.h;
+    irect_t dst = { (int)(sx - sprite_w / 2) + effect->core.render_offset.x,
+        (int)(sy - sprite_h / 2) + effect->core.render_offset.y, sprite_w, sprite_h };
+    if (dst.x > app->win.w || dst.y > app->win.h ||
+        dst.x + dst.w < 0 || dst.y + dst.h < 0) {
+        debug_effects_log("render skip slot=%d sprite=%s frame_count=%d pos=%.2f,%.2f dst=%d,%d,%d,%d reason=offscreen",
+                          i, effect->core.sprite_name,
+                          sprite->numlumps, position.x, position.y,
+                          dst.x, dst.y, dst.w, dst.h);
+        return;
+    }
+    uint32_t flip = (effect->core.render_flags & RTS_FRAME_FLIP_X) ? V_FLIP_X : 0;
+    if (R_RenderIndexedBlend(app, sprite, frame, dst, effect->core.render_flags,
+                             0)) return;
+    R_DrawSprite(sprite, frame, mobj_remap(effect, game_info), NULL, &dst,
+                 flip, effect->core.render_intensity);
+}
+
+static void order_selected_at(app_t *app, const level_t *map,
+                              mobj_t *const *units, int unit_count,
+                              const spritesheet_t *fallback_sprite, const spritecache_t *cache,
+                              const gameinfo_t *game_info, ivec2_t mouse) {
+    fvec2_t goal;
+    screen_to_map_grid_point(app, map, mouse.x, mouse.y, &goal.x, &goal.y);
+    int target = R_PickUnit(app, map, units, unit_count, fallback_sprite, cache,
+                              game_info, mouse.x, mouse.y, -1);
+    bool attack = target >= 0 && units[target]->owner != consoleplayer && units[target]->hp > 0;
+    ticorder_t order = TC_ORDER;
+    if (attack) {
+        for (int v = 0; v < map->resource_vent_count; ++v) {
+            const resourcevent_t *vent = &map->resource_vents[v];
+            if (vent->source_id != units[target]->id) continue;
+            for (int i = 0; i < unit_count; ++i) {
+                const mobj_t *unit = units[i];
+                if (!P_MobjIsSelected(unit) || unit->owner != consoleplayer ||
+                    !(unit->traits & MF_HARVESTER) || !P_VentOpenTo(map, vent, unit)) continue;
+                goal = fvec2_from_fixed2(vent->attachment);
+                attack = false;
+                break;
+            }
+            if (!attack) break;
+        }
+    }
+    if (R_Policy()->stance == STANCE_MOVE_ONLY_STICKY)
+        for (int i = 0; i < unit_count; ++i)
+            if (P_MobjIsSelected(units[i]) && units[i]->owner == consoleplayer && units[i]->move_only) {
+                order = TC_MOVE;
+                attack = false;
+                break;
+            }
+    /* An own target goes along too: StarCraft infantry board a Bunker. */
+    G_SelectedTiccmd(attack ? TC_ATTACK : order, units, unit_count, fixed2_from_fvec2(goal),
+                     attack || (target >= 0 && units[target]->owner == consoleplayer) ? units[target]->id : 0);
+}
+
+void G_Responder(app_t *app, const level_t *map, mobj_t *const *units, int unit_count,
+                  const spritesheet_t *fallback_sprite, const spritecache_t *cache,
+                  const gameinfo_t *game_info, const SDL_Event *e) {
+    switch (e->type) {
+        case SDL_QUIT:
+            app->running = false;
+            break;
+        case SDL_WINDOWEVENT:
+            if (e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                R_RefreshViewport(app);
+            }
+            break;
+        case SDL_KEYDOWN:
+            if (!e->key.repeat && (e->key.keysym.sym == SDLK_RETURN ||
+                                  e->key.keysym.sym == SDLK_KP_ENTER))
+                G_SelectedTiccmd(TC_DEPLOY, units, unit_count, (fixed2_t){0}, 0);
+            if (e->key.keysym.sym == SDLK_ESCAPE) app->running = false;
+            if (e->key.keysym.sym == SDLK_g) app->show_grid = !app->show_grid;
+            if (e->key.keysym.sym == SDLK_b) app->show_blocked = !app->show_blocked;
+            if (e->key.keysym.sym == SDLK_a && (e->key.keysym.mod & KMOD_CTRL)) {
+                for (int i = 0; i < unit_count; ++i) {
+                    P_MobjSetSelected(units[i], P_VisibleToPlayer(units[i]) &&
+                        units[i]->owner == consoleplayer && (units[i]->traits & MF_SELECTABLE) != 0 &&
+                        units[i]->hp > 0);
+                }
+                S_Bark(units, unit_count, SE_SELECT, true);
+            }
+            break;
+        case SDL_MOUSEMOTION:
+            R_WindowToRenderPt(app, e->motion.x, e->motion.y, &app->mouse.x, &app->mouse.y);
+            if (app->panning) {
+                float dx = 0.0f, dy = 0.0f;
+                R_WindowToRenderDelta(app, e->motion.xrel, e->motion.yrel, &dx, &dy);
+                app->cam.x += dx;
+                app->cam.y += dy;
+            }
+            if (app->dragging_select) {
+                int mx = 0, my = 0;
+                R_WindowToRenderPt(app, e->motion.x, e->motion.y, &mx, &my);
+                app->selection_rect = irect_from_points(app->mouse_down, (ivec2_t){ mx, my });
+            }
+            break;
+        case SDL_MOUSEBUTTONDOWN:
+            if (e->button.button == SDL_BUTTON_LEFT) {
+                R_WindowToRenderPt(app, e->button.x, e->button.y,
+                                   &app->mouse_down.x, &app->mouse_down.y);
+                app->dragging_select = true;
+                app->selection_rect = (irect_t){ app->mouse_down.x, app->mouse_down.y, 0, 0 };
+            } else if (e->button.button == SDL_BUTTON_RIGHT) {
+                if (R_Policy()->input == INPUT_RIGHT_CLICK_ORDERS) {
+                    ivec2_t mouse;
+                    R_WindowToRenderPt(app, e->button.x, e->button.y, &mouse.x, &mouse.y);
+                    order_selected_at(app, map, units, unit_count, fallback_sprite, cache,
+                                      game_info, mouse);
+                } else {
+                    app->dragging_select = false;
+                    app->selection_rect = (irect_t){0};
+                    for (int i = 0; i < unit_count; ++i)
+                        P_MobjSetSelected(units[i], false);
+                }
+            } else if (e->button.button == SDL_BUTTON_MIDDLE) {
+                app->panning = true;
+            }
+            break;
+        case SDL_MOUSEBUTTONUP:
+            if (e->button.button == SDL_BUTTON_LEFT && app->dragging_select) {
+                int bx = 0, by = 0;
+                R_WindowToRenderPt(app, e->button.x, e->button.y, &bx, &by);
+                irect_t rect = irect_from_points(app->mouse_down, (ivec2_t){ bx, by });
+                bool box = rect.w >= 10 && rect.h >= 10;
+                bool additive = (SDL_GetModState() & KMOD_SHIFT) != 0;
+                app->dragging_select = false;
+                app->selection_rect = (irect_t){0};
+                int picked = box ? -1 : R_PickUnit(app, map, units, unit_count,
+                    fallback_sprite, cache, game_info, bx, by, consoleplayer);
+                if (!box && !additive && picked < 0 && R_Policy()->select == SELECT_ANY) {
+                    bool own = false;
+                    for (int i = 0; i < unit_count; ++i)
+                        if (P_MobjIsSelected(units[i]) && units[i]->owner == consoleplayer &&
+                            units[i]->hp > 0)
+                            own = true;
+                    if (!own)
+                        picked = R_PickUnit(app, map, units, unit_count, fallback_sprite, cache,
+                                            game_info, bx, by, -1);
+                }
+                if (!box && !additive && picked < 0 &&
+                    !(R_Policy()->input == INPUT_RIGHT_CLICK_ORDERS)) {
+                    for (int i = 0; i < unit_count; ++i) {
+                        if (P_MobjIsSelected(units[i]) && units[i]->owner == consoleplayer && units[i]->hp > 0) {
+                            order_selected_at(app, map, units, unit_count, fallback_sprite,
+                                              cache, game_info, (ivec2_t){bx, by});
+                            return;
+                        }
+                    }
+                }
+                if (!additive) {
+                    for (int i = 0; i < unit_count; ++i)
+                        P_MobjSetSelected(units[i], false);
+                }
+                if (box) {
+                    for (int i = 0; i < unit_count; ++i) {
+                        if (!P_VisibleToPlayer(units[i])) continue;
+                        if (units[i]->hp <= 0) continue;
+                        if ((units[i]->traits & MF_SELECTABLE) == 0) continue;
+                        if (units[i]->owner != consoleplayer) continue;
+                        irect_t visible;
+                        float sx = 0.0f, sy = 0.0f;
+                        unit_screen_rect_for_view(app, map, units[i], fallback_sprite, cache,
+                                                  game_info, app->ticks_ms, NULL, &visible,
+                                                  &sx, &sy, NULL, NULL, NULL);
+                        float radius = unit_pick_radius_px(app, units[i]);
+                        if (irect_intersects(visible, rect) ||
+                            circle_intersects_rect((fvec2_t){ sx, sy }, radius, rect)) {
+                            P_MobjSetSelected(units[i], true);
+                        }
+                    }
+                } else {
+                    if (picked >= 0) {
+                        P_MobjSetSelected(units[picked], true);
+                    }
+                }
+                S_Bark(units, unit_count, SE_SELECT, true);
+            } else if (e->button.button == SDL_BUTTON_MIDDLE) {
+                app->panning = false;
+            }
+            break;
+        case SDL_MOUSEWHEEL:
+            app->cam.y += (float)e->wheel.y * 48.0f;
+            app->cam.x += (float)e->wheel.x * 48.0f;
+            break;
+        default:
+            break;
+    }
+}
+
+void G_CameraMove(app_t *app, float dt) {
+    const Uint8 *keys = SDL_GetKeyboardState(NULL);
+    float speed = 600.0f * dt;
+    if (keys[SDL_SCANCODE_LEFT] || keys[SDL_SCANCODE_A]) app->cam.x += speed;
+    if (keys[SDL_SCANCODE_RIGHT] || keys[SDL_SCANCODE_D]) app->cam.x -= speed;
+    if (keys[SDL_SCANCODE_UP] || keys[SDL_SCANCODE_W]) app->cam.y += speed;
+    if (keys[SDL_SCANCODE_DOWN] || keys[SDL_SCANCODE_S]) app->cam.y -= speed;
+}
+
+void R_ClampCamera(app_t *app, const level_t *map, int viewport_w, int viewport_h) {
+    if (!app || !map || map->width <= 0 || map->height <= 0) return;
+    if (viewport_w <= 0) viewport_w = app->win.w;
+    if (viewport_h <= 0) viewport_h = app->win.h;
+
+    float map_w = (float)map->width * (float)app_cell_w(app);
+    float map_h = (float)map->height * (float)app_cell_h(app);
+    /* A left-hand panel shifts the visible map. Origin 0 keeps the old clamp. */
+    float left = (float)G_WorldViewport(app).x;
+    if (map_w <= (float)viewport_w) {
+        app->cam.x = left + ((float)viewport_w - map_w) * 0.5f;
+    } else {
+        float min_x = left + (float)viewport_w - map_w;
+        float max_x = left;
+        if (app->cam.x < min_x) app->cam.x = min_x;
+        if (app->cam.x > max_x) app->cam.x = max_x;
+    }
+    if (map_h <= (float)viewport_h) {
+        app->cam.y = ((float)viewport_h - map_h) * 0.5f;
+    } else {
+        float min_y = (float)viewport_h - map_h;
+        if (app->cam.y < min_y) app->cam.y = min_y;
+        if (app->cam.y > 0.0f) app->cam.y = 0.0f;
+    }
+}
+
+void R_FreeTileset(tileset_t *tileset) {
+    if (tileset->indices && tileset->count > 0 && tileset->tile_w > 0 && tileset->tile_h > 0)
+        R_DropIndexed(tileset->indices,
+                      (size_t)tileset->count * (size_t)tileset->tile_w * (size_t)tileset->tile_h);
+    free(tileset->indices);
+    free(tileset->palette_cycle.tiles);
+    free(tileset->tile_lookup);
+    free(tileset->animations);
+    memset(tileset, 0, sizeof(*tileset));
+}
+
+void R_FreeSprite(spritesheet_t *sprite) {
+    if (!sprite) return;
+    for (int i = 0; i < sprite->numlumps; ++i) {
+        spritelump_t *lump = &sprite->lumps[i];
+        R_DropIndexed(lump->indices, 0);
+        free(lump->indices);
+    }
+    free_sprite_def(&sprite->spritedef);
+    free(sprite->cells);
+    free(sprite->lumps);
+    free(sprite->palette_maps);
+    memset(sprite, 0, sizeof(*sprite));
+}
+
+void HU_FreeFont(bitmapfont_t *font) {
+    if (!font) return;
+    R_FreeSprite(&font->sprite);
+    memset(font, 0, sizeof(*font));
+}
+
+void R_FreeSpriteCache(spritecache_t *cache) {
+    if (cache->ui) {
+        R_FreeSpriteCache(cache->ui);
+        free(cache->ui);
+    }
+    for (int i = 0; i < cache->count; ++i) {
+        R_FreeSprite(&cache->entries[i].sprite);
+    }
+    free(cache->sprites);
+    free(cache->turrets);
+    memset(cache, 0, sizeof(*cache));
+}

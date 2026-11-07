@@ -1,0 +1,539 @@
+#include "p_nav.h"
+#include "engine.h"
+
+/* Costs are integers so plans are identical on every host (lockstep play).
+ * Entering a cell costs (base + penalties) * 100 / speed%. */
+enum {
+    COST_STRAIGHT = 100, COST_DIAGONAL = 141,
+    COST_NEAR_WALL = 30,      /* hugging a wall is slower to steer and easier to jam */
+    COST_SOFT_BLOCKER = 600,  /* crossing a cell an idle unit sits on, about six cells of detour */
+};
+
+/* Per movement class: which cells touch an obstacle and which component a cell is in. */
+typedef struct {
+    bool built;
+    int size;           /* cells per side of the class's block; nodes, not cells, index the arrays */
+    uint8_t *speed;     /* slowest L_MoveSpeed under each node's block, read in every search step */
+    uint8_t *near_wall;
+    uint16_t *region;   /* 0 = impassable for this class */
+    int max_speed;      /* fastest terrain; keeps the heuristic admissible */
+} navlayer_t;
+
+struct nav_s {
+    int width, height;
+    uint8_t *snap_blocked, *snap_effect, *snap_solid, *snap_terrain; /* a mismatch drops every layer */
+    navlayer_t layer[RTS_MAX_MOVE_CLASSES];
+    int *g, *parent;
+    uint32_t *stamp;    /* generation of g/parent/closed, avoids clearing per search */
+    uint8_t *closed;
+    uint32_t generation;
+    uint64_t *heap;
+    int heap_count, heap_capacity;
+};
+
+static navstats_t stats;
+
+navstats_t P_NavStats(void) { return stats; }
+
+static const int8_t neighbor[8][2] = {
+    {0,-1}, {1,0}, {0,1}, {-1,0}, {1,-1}, {1,1}, {-1,1}, {-1,-1},
+};
+
+static int class_of(const level_t *map, int move_class) {
+    if (move_class <= 0 || !map->speeds || move_class >= map->speeds->class_count) return 0;
+    return move_class;
+}
+
+enum { NAV_MAX_FOOTPRINT = 4 };
+
+int P_NavFootprint(const level_t *map, int move_class) {
+    int cls = map ? class_of(map, move_class) : 0;
+    int size = map && map->speeds ? map->speeds->footprint[cls] : 1;
+    return size < 1 ? 1 : size > NAV_MAX_FOOTPRINT ? NAV_MAX_FOOTPRINT : size;
+}
+
+/* A node's block starts size/2 cells up and left of it; its centre is the
+ * node's world point. */
+static fixed2_t node_point(int size, ivec2_t node) {
+    fixed_t half = size * (FIXED_ONE / 2);
+    return (fixed2_t){FIXED_FROM_INT(node.x - size / 2) + half, FIXED_FROM_INT(node.y - size / 2) + half};
+}
+
+static ivec2_t node_at(int size, fixed2_t at) {
+    fixed_t shift = FIXED_ONE / 2 - size * (FIXED_ONE / 2);
+    return (ivec2_t){fixed_floor_int(at.x + shift) + size / 2, fixed_floor_int(at.y + shift) + size / 2};
+}
+
+fixed2_t P_NavNodePoint(const level_t *map, int move_class, ivec2_t node) {
+    return node_point(P_NavFootprint(map, move_class), node);
+}
+
+ivec2_t P_NavNodeAt(const level_t *map, int move_class, fixed2_t at) {
+    return node_at(P_NavFootprint(map, move_class), at);
+}
+
+int P_NavRing(const level_t *map, int move_class, ivec2_t cell, isize2_t size, ivec2_t *out, int max) {
+    int n = P_NavFootprint(map, move_class), count = 0;
+    for (int y = cell.y - n; y <= cell.y + size.h; ++y)
+        for (int x = cell.x - n; x <= cell.x + size.w; ++x) {
+            /* (x, y) is the block's top-left cell; skip blocks inside the footprint. */
+            if (x + n > cell.x && x < cell.x + size.w && y + n > cell.y && y < cell.y + size.h) continue;
+            if (count < max) out[count] = (ivec2_t){x + n / 2, y + n / 2};
+            ++count;
+        }
+    return count < max ? count : max;
+}
+
+static int speed_at(const level_t *map, const navlayer_t *layer, int x, int y) {
+    return L_Contains(map, x, y) ? layer->speed[L_Index(map, x, y)] : 0;
+}
+
+static bool passable(const level_t *map, const navlayer_t *layer, int x, int y) {
+    return speed_at(map, layer, x, y) > 0;
+}
+
+static bool step_allowed(const level_t *map, const navlayer_t *layer, int x, int y, int dx, int dy) {
+    if (!passable(map, layer, x + dx, y + dy)) return false;
+    /* Never cut a blocked corner. */
+    return !dx || !dy || (passable(map, layer, x + dx, y) && passable(map, layer, x, y + dy));
+}
+
+static void layer_release(navlayer_t *layer) {
+    free(layer->speed);
+    free(layer->near_wall);
+    free(layer->region);
+    *layer = (navlayer_t){0};
+}
+
+static void nav_release(struct nav_s *nav) {
+    if (!nav) return;
+    for (int i = 0; i < RTS_MAX_MOVE_CLASSES; ++i) layer_release(&nav->layer[i]);
+    free(nav->snap_blocked); free(nav->snap_effect); free(nav->snap_solid); free(nav->snap_terrain);
+    free(nav->g); free(nav->parent); free(nav->stamp); free(nav->closed); free(nav->heap);
+    free(nav);
+}
+
+void P_NavFree(level_t *map) {
+    if (!map) return;
+    nav_release(map->nav);
+    map->nav = NULL;
+}
+
+static bool same_bytes(const uint8_t *snapshot, const uint8_t *now, size_t total, uint8_t missing) {
+    if (now) return memcmp(snapshot, now, total) == 0;
+    for (size_t i = 0; i < total; ++i) if (snapshot[i] != missing) return false;
+    return true;
+}
+
+static bool nav_matches(const level_t *map, const struct nav_s *nav) {
+    size_t total = (size_t)map->width * map->height;
+    return same_bytes(nav->snap_blocked, map->blocked, total, 0) &&
+           same_bytes(nav->snap_effect, map->cell_effect, total, 255) &&
+           same_bytes(nav->snap_solid, map->cell_solid, total, 0) &&
+           same_bytes(nav->snap_terrain, map->cell_terrain, total, 15);
+}
+
+static void take_snapshot(const level_t *map, struct nav_s *nav) {
+    size_t total = (size_t)map->width * map->height;
+    if (map->blocked) memcpy(nav->snap_blocked, map->blocked, total); else memset(nav->snap_blocked, 0, total);
+    if (map->cell_effect) memcpy(nav->snap_effect, map->cell_effect, total); else memset(nav->snap_effect, 255, total);
+    if (map->cell_solid) memcpy(nav->snap_solid, map->cell_solid, total); else memset(nav->snap_solid, 0, total);
+    if (map->cell_terrain) memcpy(nav->snap_terrain, map->cell_terrain, total); else memset(nav->snap_terrain, 15, total);
+}
+
+/* The cache validates itself against the terrain arrays, so buildings,
+ * destruction and scripted terrain changes never need to invalidate it. */
+static struct nav_s *nav_for(const level_t *map) {
+    if (!map || map->width <= 0 || map->height <= 0) return NULL;
+    struct nav_s *nav = map->nav;
+    size_t total = (size_t)map->width * map->height;
+    if (nav && nav->width == map->width && nav->height == map->height) {
+        if (nav_matches(map, nav)) return nav;
+        for (int i = 0; i < RTS_MAX_MOVE_CLASSES; ++i) layer_release(&nav->layer[i]);
+        take_snapshot(map, nav);
+        return nav;
+    }
+    nav_release(nav);
+    nav = calloc(1, sizeof(*nav));
+    if (!nav) { ((level_t *)map)->nav = NULL; return NULL; }
+    nav->width = map->width; nav->height = map->height;
+    nav->snap_blocked = malloc(total); nav->snap_effect = malloc(total); nav->snap_solid = malloc(total);
+    nav->snap_terrain = malloc(total);
+    nav->g = calloc(total, sizeof(*nav->g));
+    nav->parent = calloc(total, sizeof(*nav->parent));
+    nav->stamp = calloc(total, sizeof(*nav->stamp));
+    nav->closed = calloc(total, 1);
+    if (!nav->snap_blocked || !nav->snap_effect || !nav->snap_solid || !nav->snap_terrain ||
+        !nav->g || !nav->parent ||
+        !nav->stamp || !nav->closed) {
+        nav_release(nav);
+        ((level_t *)map)->nav = NULL;
+        return NULL;
+    }
+    take_snapshot(map, nav);
+    ((level_t *)map)->nav = nav;
+    return nav;
+}
+
+static void build_regions(const level_t *map, struct nav_s *nav, navlayer_t *layer) {
+    int total = nav->width * nav->height;
+    int *queue = malloc((size_t)total * sizeof(*queue));
+    if (!queue) return;
+    uint16_t next = 1;
+    for (int start = 0; start < total; ++start) {
+        ivec2_t cell = L_Cell(map, start);
+        if (layer->region[start] || !layer->speed[start]) continue;
+        if (next == UINT16_MAX) { /* Merge overflow into the last region; still sound for rejection. */
+            layer->region[start] = next;
+            continue;
+        }
+        int head = 0, tail = 0;
+        queue[tail++] = start;
+        layer->region[start] = next;
+        while (head < tail) {
+            cell = L_Cell(map, queue[head++]);
+            for (int d = 0; d < 8; ++d) {
+                int dx = neighbor[d][0], dy = neighbor[d][1];
+                if (!step_allowed(map, layer, cell.x, cell.y, dx, dy)) continue;
+                int ni = L_Index(map, cell.x + dx, cell.y + dy);
+                if (layer->region[ni]) continue;
+                layer->region[ni] = next;
+                queue[tail++] = ni;
+            }
+        }
+        ++next;
+    }
+    free(queue);
+}
+
+static navlayer_t *layer_for(const level_t *map, struct nav_s *nav, int cls) {
+    navlayer_t *layer = &nav->layer[cls];
+    if (layer->built) return layer;
+    size_t total = (size_t)nav->width * nav->height;
+    layer->speed = malloc(total);
+    layer->near_wall = calloc(total, 1);
+    layer->region = calloc(total, sizeof(*layer->region));
+    if (!layer->speed || !layer->near_wall || !layer->region) { layer_release(layer); return NULL; }
+    layer->max_speed = 100;
+    layer->size = P_NavFootprint(map, cls);
+    for (int y = 0; y < nav->height; ++y)
+        for (int x = 0; x < nav->width; ++x) {
+            int speed = L_MoveSpeed(map, cls, x, y);
+            if (speed > layer->max_speed) layer->max_speed = speed;
+            layer->speed[L_Index(map, x, y)] = (uint8_t)speed;
+        }
+    if (layer->size > 1) { /* A node is as slow as the worst cell its block covers. */
+        uint8_t *cell_speed = layer->speed;
+        if (!(layer->speed = malloc(total))) { layer->speed = cell_speed; layer_release(layer); return NULL; }
+        int lead = layer->size / 2;
+        for (int y = 0; y < nav->height; ++y)
+            for (int x = 0; x < nav->width; ++x) {
+                int slowest = 255;
+                for (int by = y - lead; by < y - lead + layer->size && slowest; ++by)
+                    for (int bx = x - lead; bx < x - lead + layer->size && slowest; ++bx) {
+                        int speed = L_Contains(map, bx, by) ? cell_speed[L_Index(map, bx, by)] : 0;
+                        if (speed < slowest) slowest = speed;
+                    }
+                layer->speed[L_Index(map, x, y)] = (uint8_t)slowest;
+            }
+        free(cell_speed);
+    }
+    for (int y = 0; y < nav->height; ++y)
+        for (int x = 0; x < nav->width; ++x) {
+            bool near = false;
+            for (int d = 0; d < 8 && !near; ++d)
+                near = L_Contains(map, x + neighbor[d][0], y + neighbor[d][1]) &&
+                       !passable(map, layer, x + neighbor[d][0], y + neighbor[d][1]);
+            layer->near_wall[L_Index(map, x, y)] = near;
+        }
+    build_regions(map, nav, layer);
+    layer->built = true;
+    return layer;
+}
+
+/* Binary min-heap of (f, -g, index). Larger g wins ties, which keeps routes
+ * straight instead of fanning out across equal-cost plateaus. Index gets 18
+ * bits (512x512), the tie-break 16, f the remaining 30. */
+static uint64_t heap_key(int f, int g, int index) {
+    uint64_t tie = 0xFFFF - (uint64_t)((g >> 4) > 0xFFFF ? 0xFFFF : (g >> 4));
+    uint64_t cost = (uint64_t)(f > 0x3FFFFFFF ? 0x3FFFFFFF : f);
+    return (cost << 34) | (tie << 18) | (uint64_t)index;
+}
+
+static bool heap_push(struct nav_s *nav, uint64_t key) {
+    if (nav->heap_count == nav->heap_capacity) {
+        int capacity = nav->heap_capacity ? nav->heap_capacity * 2 : 1024;
+        uint64_t *grown = realloc(nav->heap, (size_t)capacity * sizeof(*grown));
+        if (!grown) return false;
+        nav->heap = grown;
+        nav->heap_capacity = capacity;
+    }
+    int i = nav->heap_count++;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (nav->heap[parent] <= key) break;
+        nav->heap[i] = nav->heap[parent];
+        i = parent;
+    }
+    nav->heap[i] = key;
+    return true;
+}
+
+static uint64_t heap_pop(struct nav_s *nav) {
+    uint64_t top = nav->heap[0], last = nav->heap[--nav->heap_count];
+    int i = 0;
+    for (;;) {
+        int child = i * 2 + 1;
+        if (child >= nav->heap_count) break;
+        if (child + 1 < nav->heap_count && nav->heap[child + 1] < nav->heap[child]) ++child;
+        if (nav->heap[child] >= last) break;
+        nav->heap[i] = nav->heap[child];
+        i = child;
+    }
+    if (nav->heap_count) nav->heap[i] = last;
+    return top;
+}
+
+static int octile(int dx, int dy, int max_speed) {
+    dx = abs(dx); dy = abs(dy);
+    int lo = dx < dy ? dx : dy, hi = dx < dy ? dy : dx;
+    return (COST_STRAIGHT * hi + (COST_DIAGONAL - COST_STRAIGHT) * lo) * 100 / max_speed;
+}
+
+const uint16_t *P_NavRegions(const level_t *map, int move_class) {
+    struct nav_s *nav = nav_for(map);
+    navlayer_t *layer = nav ? layer_for(map, nav, class_of(map, move_class)) : NULL;
+    return layer ? layer->region : NULL;
+}
+
+bool P_NavReachable(const level_t *map, int move_class, ivec2_t from, ivec2_t to) {
+    struct nav_s *nav = nav_for(map);
+    if (!nav || !L_Contains(map, from.x, from.y) || !L_Contains(map, to.x, to.y)) return false;
+    navlayer_t *layer = layer_for(map, nav, class_of(map, move_class));
+    if (!layer) return false;
+    uint16_t a = layer->region[L_Index(map, from.x, from.y)];
+    return a && a == layer->region[L_Index(map, to.x, to.y)];
+}
+
+bool P_NavNearestReachable(const level_t *map, int move_class, ivec2_t from, ivec2_t wanted,
+                           int radius, ivec2_t *out) {
+    struct nav_s *nav = nav_for(map);
+    if (!nav || !out || !L_Contains(map, from.x, from.y)) return false;
+    navlayer_t *layer = layer_for(map, nav, class_of(map, move_class));
+    if (!layer) return false;
+    uint16_t region = layer->region[L_Index(map, from.x, from.y)];
+    if (!region) return false;
+    int best = INT32_MAX;
+    for (int dy = -radius; dy <= radius; ++dy)
+        for (int dx = -radius; dx <= radius; ++dx) {
+            ivec2_t c = {wanted.x + dx, wanted.y + dy};
+            if (!L_Contains(map, c.x, c.y) || layer->region[L_Index(map, c.x, c.y)] != region)
+                continue;
+            int d = dx * dx + dy * dy;
+            if (d < best) { best = d; *out = c; }
+        }
+    return best != INT32_MAX;
+}
+
+enum { SAMPLE_SPACING = FIXED_ONE / 4 }; /* Probe spacing along a segment. */
+
+/* Number of probe intervals (>= 1) along a segment of the given length. */
+static int sample_steps(fixed_t length) {
+    int steps = (int)((length + SAMPLE_SPACING - 1) / SAMPLE_SPACING);
+    return steps < 1 ? 1 : steps;
+}
+
+/* a + delta * i / steps, exact integer interpolation. */
+static fixed2_t lerp_step(fixed2_t a, fixed2_t delta, int64_t numerator, int steps) {
+    return (fixed2_t){ a.x + (fixed_t)((int64_t)delta.x * numerator / steps),
+                       a.y + (fixed_t)((int64_t)delta.y * numerator / steps) };
+}
+
+bool P_NavLineClear(const level_t *map, int move_class, fixed2_t a, fixed2_t b, fixed_t radius) {
+    fixed2_t delta = fixed2_sub(b, a);
+    int steps = sample_steps(fixed2_length(delta));
+    for (int i = 0; i <= steps; ++i) {
+        fixed2_t at = lerp_step(a, delta, i, steps);
+        /* The origin may overlap terrain (authored spawns); leaving it is allowed. */
+        if (!P_MapCircleWalkable(map, move_class, at, radius, &a)) return false;
+    }
+    return true;
+}
+
+static bool cell_usable(const level_t *map, int cls, const navlayer_t *layer, int x, int y, fixed_t radius) {
+    if (!passable(map, layer, x, y)) return false;
+    /* A disc no wider than the node's open block always fits. */
+    if (radius <= layer->size * (FIXED_ONE / 2)) return true;
+    return P_MapCircleWalkable(map, cls, node_point(layer->size, (ivec2_t){x, y}), radius, NULL);
+}
+
+static bool search(const level_t *map, int cls, struct nav_s *nav, navlayer_t *layer,
+                   const uint8_t *soft, fixed_t radius, ivec2_t start, ivec2_t goal,
+                   int *goal_index) {
+    if (++nav->generation == 0) {
+        memset(nav->stamp, 0, (size_t)nav->width * nav->height * sizeof(*nav->stamp));
+        nav->generation = 1;
+    }
+    nav->heap_count = 0;
+    int s = L_Index(map, start.x, start.y), t = L_Index(map, goal.x, goal.y);
+    nav->stamp[s] = nav->generation;
+    nav->g[s] = 0;
+    nav->parent[s] = -1;
+    nav->closed[s] = 0;
+    ++stats.searches;
+    if (!heap_push(nav, heap_key(octile(start.x - goal.x, start.y - goal.y, layer->max_speed), 0, s)))
+        return false;
+    while (nav->heap_count) {
+        int cur = (int)(heap_pop(nav) & 0x3FFFF);
+        if (nav->closed[cur]) continue;
+        nav->closed[cur] = 1;
+        ++stats.expansions;
+        if (cur == t) { *goal_index = cur; return true; }
+        ivec2_t cell = L_Cell(map, cur);
+        for (int d = 0; d < 8; ++d) {
+            int dx = neighbor[d][0], dy = neighbor[d][1];
+            if (!step_allowed(map, layer, cell.x, cell.y, dx, dy)) continue;
+            int nx = cell.x + dx, ny = cell.y + dy, ni = L_Index(map, nx, ny);
+            if (ni != t && !cell_usable(map, cls, layer, nx, ny, radius)) continue;
+            int speed = layer->speed[ni];
+            int step = (dx && dy ? COST_DIAGONAL : COST_STRAIGHT) +
+                       (layer->near_wall[ni] ? COST_NEAR_WALL : 0) +
+                       (soft && soft[ni] && ni != t ? COST_SOFT_BLOCKER : 0);
+            int cost = nav->g[cur] + step * 100 / speed;
+            if (nav->stamp[ni] != nav->generation) {
+                nav->stamp[ni] = nav->generation;
+                nav->closed[ni] = 0;
+            } else if (cost >= nav->g[ni]) continue;
+            nav->g[ni] = cost;
+            nav->parent[ni] = cur;
+            if (!heap_push(nav, heap_key(cost + octile(nx - goal.x, ny - goal.y, layer->max_speed),
+                                         cost, ni)))
+                return false;
+        }
+    }
+    return false;
+}
+
+/* Travel cost of a straight segment in cell-lengths of full-speed ground,
+ * 16.16 in a 64-bit accumulator (a slow swamp can price past 16.16 range). */
+static int64_t segment_cost(const level_t *map, const navlayer_t *layer, const uint8_t *soft, fixed2_t a, fixed2_t b) {
+    fixed2_t delta = fixed2_sub(b, a);
+    fixed_t length = fixed2_length(delta);
+    int steps = (int)((length + SAMPLE_SPACING - 1) / SAMPLE_SPACING);
+    if (steps < 1) return 0;
+    int64_t total = 0;
+    for (int i = 0; i < steps; ++i) {
+        fixed2_t at = lerp_step(a, delta, 2 * i + 1, 2 * steps);
+        ivec2_t cell = node_at(layer->size, at);
+        int speed = speed_at(map, layer, cell.x, cell.y);
+        total += (int64_t)100 * FIXED_ONE / (speed > 0 ? speed : 100);
+        if (soft && L_Contains(map, cell.x, cell.y) && soft[L_Index(map, cell.x, cell.y)])
+            total += (int64_t)COST_SOFT_BLOCKER * FIXED_ONE / 100; /* an idle unit's cell */
+    }
+    return total * length / ((int64_t)steps * FIXED_ONE);
+}
+
+bool P_NavPlan(const level_t *map, int move_class, fixed_t radius, fixed2_t from, fixed2_t goal,
+               const uint8_t *soft, navpath_t *out) {
+    if (!out) return false;
+    *out = (navpath_t){0};
+    struct nav_s *nav = nav_for(map);
+    if (!nav) return false;
+    int cls = class_of(map, move_class);
+    navlayer_t *layer = layer_for(map, nav, cls);
+    if (!layer) return false;
+    ivec2_t start = node_at(layer->size, from), end = node_at(layer->size, goal);
+    if (!L_Contains(map, start.x, start.y)) return false;
+    if (!passable(map, layer, start.x, start.y)) { /* Spawn overlapping terrain: begin at a neighbour. */
+        bool found = false;
+        int64_t best = INT64_MAX;
+        fixed2_t seed = {0, 0};
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx) {
+                if (!passable(map, layer, start.x + dx, start.y + dy)) continue;
+                fixed2_t c = node_point(layer->size, (ivec2_t){start.x + dx, start.y + dy});
+                int64_t d = fixed2_distance_squared64(c, from) >> 24;
+                if (d < best) { best = d; found = true; seed = c; }
+            }
+        if (!found) return false;
+        start = node_at(layer->size, seed);
+    }
+    bool exact_goal = L_Contains(map, end.x, end.y) && passable(map, layer, end.x, end.y) &&
+                      P_NavReachable(map, cls, start, end) &&
+                      P_MapCircleWalkable(map, cls, goal, radius, NULL);
+    if (!exact_goal) {
+        ivec2_t want = {end.x < 0 ? 0 : end.x >= map->width ? map->width - 1 : end.x,
+                        end.y < 0 ? 0 : end.y >= map->height ? map->height - 1 : end.y};
+        if (!P_NavNearestReachable(map, cls, start, want, 16, &end)) return false;
+        goal = node_point(layer->size, end);
+    }
+    if (ivec2_equal(start, end)) {
+        out->points[0] = out->goal = goal;
+        out->count = 1;
+        out->complete = true;
+        return true;
+    }
+    int goal_index;
+    if (!search(map, cls, nav, layer, soft, radius, start, end, &goal_index)) return false;
+
+    /* Keep the destination node's point: an off-centre goal can invalidate the
+     * incoming diagonal even though both endpoints fit. String pulling removes
+     * this last bend only when the entire shortcut is clear. */
+    int length = 0;
+    for (int c = goal_index; c != -1; c = nav->parent[c]) ++length;
+    fixed2_t *chain = malloc((size_t)(length + 1) * sizeof(*chain));
+    if (!chain) return false;
+    int i = length;
+    for (int c = goal_index; c != -1; c = nav->parent[c])
+        chain[--i] = node_point(layer->size, L_Cell(map, c));
+    chain[length++] = goal;
+    out->goal = goal;
+
+    /* Greedy string pull: extend the segment while the disc still fits and the
+     * shortcut costs no more than the route it replaces (swamp stays avoided). */
+    bool priced = cls != 0 || soft != NULL;
+    int64_t *prefix = priced ? malloc((size_t)length * sizeof(*prefix)) : NULL;
+    if (priced && !prefix) { free(chain); return false; }
+    if (priced) {
+        prefix[0] = 0;
+        for (int k = 1; k < length; ++k) prefix[k] = prefix[k - 1] + segment_cost(map, layer, soft, chain[k - 1], chain[k]);
+    }
+    fixed2_t anchor = from;
+    int at = 0;
+    out->complete = true;
+    while (at < length) {
+        int far = at;
+        int64_t lead = priced ? segment_cost(map, layer, soft, anchor, chain[at]) : 0;
+        while (far + 1 < length && P_NavLineClear(map, cls, anchor, chain[far + 1], radius) &&
+               (!priced || segment_cost(map, layer, soft, anchor, chain[far + 1]) <=
+                           (lead + prefix[far + 1] - prefix[at]) * 103 / 100 + FIXED_LIT(0.05))) ++far;
+        if (out->count == NAV_MAX_WAYPOINTS) { out->complete = false; break; }
+        out->points[out->count++] = chain[far];
+        anchor = chain[far];
+        at = far + 1;
+    }
+    free(chain);
+    free(prefix);
+    return out->count > 0;
+}
+
+int P_FindPath(const level_t *map, cell_t start, cell_t goal, cell_t *out_path, int max_path) {
+    if (!out_path || max_path <= 0) return 0;
+    struct nav_s *nav = nav_for(map);
+    navlayer_t *layer = nav ? layer_for(map, nav, 0) : NULL;
+    if (!layer || !passable(map, layer, start.x, start.y) || !L_Contains(map, goal.x, goal.y)) return 0;
+    if (!passable(map, layer, goal.x, goal.y) && !P_NavNearestReachable(map, 0, start, goal, 8, &goal))
+        return 0;
+    if (!P_NavReachable(map, 0, start, goal)) return 0;
+    if (ivec2_equal(start, goal)) { out_path[0] = start; return 1; }
+    int index;
+    if (!search(map, 0, nav, layer, NULL, 0, start, goal, &index)) return 0;
+    int total = 0;
+    for (int c = index; c != -1; c = nav->parent[c]) ++total;
+    int slot = total;
+    for (int c = index; c != -1; c = nav->parent[c]) {
+        --slot;
+        if (slot < max_path) out_path[slot] = L_Cell(map, c);
+    }
+    return total < max_path ? total : max_path;
+}

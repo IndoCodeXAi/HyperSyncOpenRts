@@ -1,0 +1,522 @@
+.DEFAULT_GOAL := all
+
+DC_SIGHT_GEN_SOURCES := $(sort $(shell find tools/dc_sight_gen -name '*.c'))
+build/dc_sight_gen: $(DC_SIGHT_GEN_SOURCES)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $^ -o $@
+
+CC ?= cc
+AR ?= ar
+PKG_CONFIG ?= pkg-config
+
+# Android uses the NDK and the same per-game source directories through CMake.
+# ANDROID_TASK can select one game, e.g. assembleDarkColonyDebug.
+ANDROID_TASK ?= assembleDebug
+.PHONY: android
+android:
+	cd android && ./gradlew $(ANDROID_TASK)
+
+# -ffp-contract=off: forbid fused multiply-add so the remaining float math (render,
+# audio, HUD, path geometry) rounds identically on x86 and Apple Silicon. Never use
+# -ffast-math. The simulation itself uses the integer helpers in include/fixed.h.
+CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g -ffp-contract=off
+CPPFLAGS += -Iinclude -Itests
+# Keep native world pixels while enlarging the HUD and menus.
+NATIVE_WORLD ?= 1
+ifeq ($(NATIVE_WORLD),1)
+CPPFLAGS += -DRTS_NATIVE_WORLD
+endif
+DEPFLAGS = -MMD -MP
+ifneq ($(MAKECMDGOALS),android)
+SDL_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2)
+SDL_LIBS := $(shell $(PKG_CONFIG) --libs sdl2)
+endif
+
+BUILD_DIR := build
+BIN_DIR   := $(BUILD_DIR)/bin
+
+ANIM_EXTRACT_TARGET    := $(BUILD_DIR)/anim_extract
+DC_INFO_CONV_TARGET    := $(BUILD_DIR)/dc_info_conv
+DR_INFO_GEN_TARGET     := $(BUILD_DIR)/dr_info_gen
+DR_UNITS_EXTRACT_TARGET := $(BUILD_DIR)/dr_units_extract
+SL_UNITS_EXTRACT_TARGET := $(BUILD_DIR)/7legion_units_extract
+SL_INFO_GEN_TARGET     := $(BUILD_DIR)/7legion_info_gen
+KKND_INFO_GEN_TARGET   := $(BUILD_DIR)/kknd_info_gen
+DC_GAMESTAT_GEN_TARGET := $(BUILD_DIR)/dc_gamestat_gen
+DC_SPR_EXTRACT_TARGET  := $(BUILD_DIR)/dc_spr_extract
+DC_FIN_EXTRACT_TARGET  := $(BUILD_DIR)/dc_fin_extract
+DC_LAYOUT_TEST_TARGET  := $(BIN_DIR)/test_dark_colony_sprite_layout
+MODEL_COMMAND_TEST_SOURCE := tests/cross-game/test_model_commands.c
+
+DATA_DIR         := data
+DARK_REIGN_ROOT  := $(DATA_DIR)/REIGN/dark
+DARK_COLONY_ROOT := $(DATA_DIR)/DCOLONY
+SEVENTH_LEGION_ROOT := $(DATA_DIR)/7LEGION
+KKND_ROOT        := $(DATA_DIR)/KKND
+
+# ── per-game engine sources (shared by all game binaries) ────────────────────
+ENGINE_SOURCES := $(sort $(shell find driver render hud interface play game sound -name '*.c'))
+
+# ── game-specific sources ────────────────────────────────────────────────────
+DR_GAME_SOURCES   := $(sort $(shell find games/dark-reign  -name '*.c'))
+DC_GAME_SOURCES   := $(sort $(shell find games/dark-colony -name '*.c'))
+SL_GAME_SOURCES   := $(sort $(shell find games/7legion     -name '*.c'))
+KKND_GAME_SOURCES := $(sort $(shell find games/kknd        -name '*.c'))
+SC_GAME_SOURCES   := $(sort $(shell find games/starcraft third_party/libsmacker -name '*.c'))
+W2_GAME_SOURCES   := $(sort $(shell find games/warcraft-2   -name '*.c'))
+Z_GAME_SOURCES    := $(sort $(shell find games/z            -name '*.c'))
+
+# ── model engine sources (headless: no SDL display entry point or HUD) ───────
+MODEL_ENGINE_SOURCES := $(sort $(shell find game driver play render hud sound -name '*.c' ! -name 'd_main.c'))
+
+# ── tool sources ─────────────────────────────────────────────────────────────
+ANIM_EXTRACT_SOURCE    := tools/anim_extract.c
+DC_INFO_CONV_SOURCES   := $(sort $(shell find tools/dc_info_conv -name '*.c'))
+DR_INFO_GEN_SOURCE     := tools/dr_info_gen.c
+SL_INFO_GEN_SOURCE     := tools/7legion_info_gen.c
+KKND_INFO_GEN_SOURCE   := tools/kknd_info_gen.c
+DC_GAMESTAT_GEN_SOURCE := tools/dc_gamestat_gen.c
+DC_FIN_EXTRACT_SOURCE  := tools/dc_fin_extract.c
+
+DC_LAYOUT_TEST_SOURCE := tests/test_dark_colony_sprite_layout.c
+
+.PHONY: all run mission-1 mission-2 test test-soak test-dark-colony test-dark-reign test-7legion test-kknd \
+        test-warcraft-2 test-headless test-model-commands test-ai test-layout test-loaders dark-reign dark-colony \
+        dark-colony-human02 dark-colony-human03 dark-colony-info dark-colony-gamestat 7legion kknd warcraft-2 z \
+		kknd-check anim-extract dc-info-conv dr-info-gen dr-units-extract dark-reign-units 7legion-units 7legion-info-gen kknd-info-gen test-info-gen \
+		dark-reign-info 7legion-info kknd-info dc-spr-extract dc-fin-extract clean help
+
+TEST_RUNNER := $(BUILD_DIR)/test_runner
+TEST_RUNNER_SOURCES := $(sort $(shell find tools/test_runner -name '*.c'))
+TEST_JOBS ?= 8
+TEST_BUDGET ?= 5
+SOAK_BUDGET ?= 600
+$(TEST_RUNNER): $(TEST_RUNNER_SOURCES)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $^ -o $@
+
+# ── per-game binary rule template ────────────────────────────────────────────
+# $(1) = binary name (e.g. dark-colony)
+# $(2) = game-specific source list
+# $(3) = game directory name (e.g. DarkColony)
+# $(4) = game-specific preprocessor flags
+
+define GAME_TARGET
+
+ALL_SRCS_$(1) := $$(ENGINE_SOURCES) $(2)
+ALL_OBJS_$(1) := $$(patsubst %.c,$(BUILD_DIR)/$(1)/%.o,$$(ALL_SRCS_$(1)))
+ALL_DEPS_$(1) := $$(ALL_OBJS_$(1):.o=.d)
+
+$(BIN_DIR)/$(1): $$(ALL_OBJS_$(1)) | $(BIN_DIR)
+	$(CC) $$^ -o $$@ $(SDL_LIBS) -lm
+
+$(BUILD_DIR)/$(1)/%.o: %.c Makefile
+	@mkdir -p $$(dir $$@)
+	$(CC) $(CPPFLAGS) $(4) -I./games/$(3) $(CFLAGS) $(DEPFLAGS) $(SDL_CFLAGS) -c $$< -o $$@
+
+-include $$(ALL_DEPS_$(1))
+endef
+
+$(eval $(call GAME_TARGET,dark-colony,$(DC_GAME_SOURCES),dark-colony,-DRTS_WORLD_Y_UP=1 -DRTS_GAME_DARK_COLONY))
+$(eval $(call GAME_TARGET,dark-reign,$(DR_GAME_SOURCES),dark-reign,-DRTS_WORLD_Y_UP=0 -DRTS_GAME_DARK_REIGN))
+$(eval $(call GAME_TARGET,7legion,$(SL_GAME_SOURCES),7legion,-DRTS_WORLD_Y_UP=0 -DRTS_GAME_7LEGION))
+$(eval $(call GAME_TARGET,kknd,$(KKND_GAME_SOURCES),kknd,-DRTS_WORLD_Y_UP=0))
+$(eval $(call GAME_TARGET,warcraft-2,$(W2_GAME_SOURCES),warcraft-2,-DRTS_WORLD_Y_UP=0 -DRTS_GAME_WARCRAFT_2))
+$(eval $(call GAME_TARGET,z,$(Z_GAME_SOURCES),z,-DRTS_WORLD_Y_UP=0))
+
+$(eval $(call GAME_TARGET,starcraft,$(SC_GAME_SOURCES),starcraft,-DRTS_WORLD_Y_UP=0 -DRTS_GAME_STARCRAFT))
+
+all: $(BIN_DIR)/starcraft $(BIN_DIR)/dark-colony $(BIN_DIR)/dark-reign $(BIN_DIR)/7legion $(BIN_DIR)/kknd $(BIN_DIR)/warcraft-2 $(BIN_DIR)/z
+
+.SECONDARY:
+
+SHARED_MODEL_TEST_SOURCES := $(sort $(shell find tests/shared -name 'test_*.c'))
+# Warcraft has its own menu and its own worker rules (the generic vent suite
+# drives the engine harvester); every other shared suite applies, the
+# computer player included.
+W2_SHARED_TEST_SOURCES := $(sort $(shell find tests/shared -name 'test_*.c' ! -name 'test_simple_menu.c' ! -name 'test_ai_vents.c'))
+# Z has no factions, purchases or computer player yet, and no recorded
+# simulation hash.
+Z_SHARED_TEST_SOURCES := $(sort $(shell find tests/shared -name 'test_*.c' ! -name 'test_ruleset.c' ! -name 'test_ai_game.c' ! -name 'test_tech_rows.c' ! -name 'test_determinism_fixed.c' ! -name 'test_simple_menu.c'))
+
+define MODEL_TESTS_FOR_GAME
+$(1)_TEST_SOURCES := $$(sort $$(shell find tests/$(1) -name 'test_*.c'))
+$(1)_SHARED_TEST_SOURCES := $(if $(4),$(4),$(SHARED_MODEL_TEST_SOURCES))
+$(1)_TEST_OBJS := $$(patsubst %.c,$(BUILD_DIR)/model-test-$(1)/%.o,$$($(1)_TEST_SOURCES))
+$(1)_TEST_OBJS += $$(patsubst %.c,$(BUILD_DIR)/model-test-$(1)/%.o,$$($(1)_SHARED_TEST_SOURCES))
+$(1)_TEST_ENGINE_OBJS := $$(patsubst %.c,$(BUILD_DIR)/model-test-$(1)/%.o,$(MODEL_ENGINE_SOURCES) $(2))
+$(1)_TEST_BINS := $$(patsubst tests/$(1)/%.c,$(BIN_DIR)/tests/$(1)/%,$$($(1)_TEST_SOURCES))
+$(1)_TEST_BINS += $$(patsubst tests/shared/%.c,$(BIN_DIR)/tests/$(1)/%,$$($(1)_SHARED_TEST_SOURCES))
+$(BUILD_DIR)/model-test-$(1)/%.o: %.c Makefile
+	@mkdir -p $$(dir $$@)
+	$(CC) $(CPPFLAGS) $(3) -I./games/$(1) $(CFLAGS) $(DEPFLAGS) $(SDL_CFLAGS) -c $$< -o $$@
+$(BIN_DIR)/tests/$(1)/%: $(BUILD_DIR)/model-test-$(1)/tests/$(1)/%.o $$($(1)_TEST_ENGINE_OBJS) | $(BIN_DIR)
+	@mkdir -p $$(dir $$@)
+	$(CC) $$^ -o $$@ $(SDL_LIBS) -lm
+$(BIN_DIR)/tests/$(1)/%: $(BUILD_DIR)/model-test-$(1)/tests/shared/%.o $$($(1)_TEST_ENGINE_OBJS) | $(BIN_DIR)
+	@mkdir -p $$(dir $$@)
+	$(CC) $$^ -o $$@ $(SDL_LIBS) -lm
+test-$(1): $(TEST_RUNNER) $$(filter-out %/test_ai_skirmish %/test_ai $(if $(filter dark-colony,$(1)),%/test_ai_factions %/test_menu) $(if $(filter warcraft-2,$(1)),%/test_ai_game),$$($(1)_TEST_BINS)) $(if $(filter dark-colony,$(1)),$(BIN_DIR)/tests/dark-colony/test_menu)
+	$(TEST_RUNNER) -j $(TEST_JOBS) -t $(TEST_BUDGET) $$(filter-out %/test_ai_skirmish %/test_ai $(if $(filter dark-colony,$(1)),%/test_ai_factions %/test_menu) $(if $(filter warcraft-2,$(1)),%/test_ai_game),$$($(1)_TEST_BINS)) $(if $(filter dark-colony,$(1)),$(BIN_DIR)/tests/dark-colony/test_menu@--quick)
+-include $$($(1)_TEST_OBJS:.o=.d) $$($(1)_TEST_ENGINE_OBJS:.o=.d)
+endef
+
+$(eval $(call MODEL_TESTS_FOR_GAME,dark-colony,$(DC_GAME_SOURCES),-DRTS_WORLD_Y_UP=1 -DRTS_GAME_DARK_COLONY))
+$(eval $(call MODEL_TESTS_FOR_GAME,dark-reign,$(DR_GAME_SOURCES),-DRTS_WORLD_Y_UP=0 -DRTS_GAME_DARK_REIGN))
+$(eval $(call MODEL_TESTS_FOR_GAME,7legion,$(SL_GAME_SOURCES),-DRTS_WORLD_Y_UP=0 -DRTS_GAME_7LEGION))
+$(eval $(call MODEL_TESTS_FOR_GAME,kknd,$(KKND_GAME_SOURCES),-DRTS_WORLD_Y_UP=0 -DRTS_GAME_KKND))
+$(eval $(call MODEL_TESTS_FOR_GAME,warcraft-2,$(W2_GAME_SOURCES),-DRTS_WORLD_Y_UP=0 -DRTS_GAME_WARCRAFT_2,$(W2_SHARED_TEST_SOURCES)))
+$(eval $(call MODEL_TESTS_FOR_GAME,z,$(Z_GAME_SOURCES),-DRTS_WORLD_Y_UP=0,$(Z_SHARED_TEST_SOURCES)))
+
+# The graphics lifecycle suite links the real SDL interface; model suites do not.
+VIDEO_TEST_SOURCES := $(sort $(shell find tests/video interface -name '*.c'))
+VIDEO_TEST_OBJS := $(patsubst %.c,$(BUILD_DIR)/model-test-dark-colony/%.o,$(VIDEO_TEST_SOURCES))
+$(BIN_DIR)/test_video_lifecycle: $(VIDEO_TEST_OBJS) $(dark-colony_TEST_ENGINE_OBJS) | $(BIN_DIR)
+	$(CC) $^ -o $@ $(SDL_LIBS) -lm
+
+# ── DC layout test ───────────────────────────────────────────────────────────
+DC_LAYOUT_TEST_OBJ := $(BUILD_DIR)/dc-test/$(DC_LAYOUT_TEST_SOURCE:.c=.o)
+DC_LAYOUT_DC_INFO_OBJ := $(BUILD_DIR)/dc-test/games/dark-colony/info.o
+
+$(BUILD_DIR)/dc-test/%.o: %.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -DRTS_WORLD_Y_UP=1 -DRTS_GAME_DARK_COLONY -I./games/dark-colony $(CFLAGS) $(DEPFLAGS) $(SDL_CFLAGS) -c $< -o $@
+
+$(DC_LAYOUT_TEST_TARGET): $(DC_LAYOUT_TEST_OBJ) $(DC_LAYOUT_DC_INFO_OBJ) | $(BIN_DIR)
+	$(CC) $^ -o $@ -lm
+
+test-layout: $(TEST_RUNNER) $(DC_LAYOUT_TEST_TARGET)
+	$(TEST_RUNNER) -j 1 -t $(TEST_BUDGET) $(DC_LAYOUT_TEST_TARGET)
+
+# ── anim_extract and info generators ─────────────────────────────────────────
+$(ANIM_EXTRACT_TARGET): $(BUILD_DIR)/tools/anim_extract.o
+	$(CC) $^ -o $@
+
+$(DC_INFO_CONV_TARGET): $(patsubst %.c,$(BUILD_DIR)/%.o,$(DC_INFO_CONV_SOURCES))
+	$(CC) $^ -o $@
+
+$(DR_INFO_GEN_TARGET): $(BUILD_DIR)/tools/dr_info_gen.o
+	$(CC) $^ -o $@
+
+$(DR_UNITS_EXTRACT_TARGET): $(BUILD_DIR)/tools/dr_units_extract.o
+	$(CC) $^ -o $@
+
+$(SL_UNITS_EXTRACT_TARGET): $(BUILD_DIR)/tools/7legion_units_extract.o
+	$(CC) $^ -o $@
+
+$(SL_INFO_GEN_TARGET): $(BUILD_DIR)/tools/7legion_info_gen.o
+	$(CC) $^ -o $@
+
+$(KKND_INFO_GEN_TARGET): $(BUILD_DIR)/tools/kknd_info_gen.o
+	$(CC) $^ -o $@
+
+$(DC_GAMESTAT_GEN_TARGET): $(BUILD_DIR)/tools/dc_gamestat_gen.o
+	$(CC) $^ -o $@
+
+$(BUILD_DIR)/tools/%.o: tools/%.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(DC_SPR_EXTRACT_TARGET): $(BUILD_DIR)/tools/dc_spr_extract.o
+	$(CC) $^ -o $@ -lm
+
+$(DC_FIN_EXTRACT_TARGET): $(BUILD_DIR)/tools/dc_fin_extract.o
+	$(CC) $^ -o $@
+
+-include $(BUILD_DIR)/tools/anim_extract.d
+-include $(patsubst %.c,$(BUILD_DIR)/%.d,$(DC_INFO_CONV_SOURCES))
+-include $(BUILD_DIR)/tools/dr_info_gen.d
+-include $(BUILD_DIR)/tools/dr_units_extract.d
+-include $(BUILD_DIR)/tools/7legion_units_extract.d
+-include $(BUILD_DIR)/tools/7legion_info_gen.d
+-include $(BUILD_DIR)/tools/kknd_info_gen.d
+-include $(BUILD_DIR)/tools/dc_gamestat_gen.d
+-include $(BUILD_DIR)/tools/dc_spr_extract.d
+-include $(BUILD_DIR)/tools/dc_fin_extract.d
+
+dc-info-conv: $(DC_INFO_CONV_TARGET)
+
+dr-info-gen: $(DR_INFO_GEN_TARGET)
+
+dr-units-extract: $(DR_UNITS_EXTRACT_TARGET)
+
+dark-reign-units: $(DR_UNITS_EXTRACT_TARGET)
+	$(DR_UNITS_EXTRACT_TARGET) $(DARK_REIGN_ROOT)
+
+7legion-units: $(SL_UNITS_EXTRACT_TARGET)
+	$(SL_UNITS_EXTRACT_TARGET) $(SEVENTH_LEGION_ROOT)
+
+7legion-info-gen: $(SL_INFO_GEN_TARGET)
+
+kknd-info-gen: $(KKND_INFO_GEN_TARGET)
+
+dark-reign-info: $(DR_INFO_GEN_TARGET)
+	$(DR_INFO_GEN_TARGET) $(DARK_REIGN_ROOT) \
+	    games/dark-reign/info.h games/dark-reign/info.c
+
+7legion-info: $(SL_INFO_GEN_TARGET)
+	$(SL_INFO_GEN_TARGET) $(SEVENTH_LEGION_ROOT) \
+	    games/7legion/info.h games/7legion/info.c
+
+kknd-info: $(KKND_INFO_GEN_TARGET)
+	$(KKND_INFO_GEN_TARGET) $(KKND_ROOT)/UNITS.CFG \
+	    games/kknd/info.h games/kknd/info.c
+
+# Prefer the system tool: a foreign-architecture cmp earlier in PATH
+# fails with "Bad CPU type" and would fail this check for the wrong reason.
+CMP := $(firstword $(wildcard /usr/bin/cmp) cmp)
+test-info-gen: $(DR_INFO_GEN_TARGET) $(SL_INFO_GEN_TARGET) $(KKND_INFO_GEN_TARGET)
+	@rm -rf $(BUILD_DIR)/info-check
+	@mkdir -p $(BUILD_DIR)/info-check/dark-reign $(BUILD_DIR)/info-check/7legion $(BUILD_DIR)/info-check/kknd
+	$(DR_INFO_GEN_TARGET) $(DARK_REIGN_ROOT) $(BUILD_DIR)/info-check/dark-reign/info.h $(BUILD_DIR)/info-check/dark-reign/info.c
+	$(SL_INFO_GEN_TARGET) $(SEVENTH_LEGION_ROOT) $(BUILD_DIR)/info-check/7legion/info.h $(BUILD_DIR)/info-check/7legion/info.c
+	$(KKND_INFO_GEN_TARGET) $(KKND_ROOT)/UNITS.CFG $(BUILD_DIR)/info-check/kknd/info.h $(BUILD_DIR)/info-check/kknd/info.c
+	$(CMP) games/dark-reign/info.h $(BUILD_DIR)/info-check/dark-reign/info.h
+	$(CMP) games/dark-reign/info.c $(BUILD_DIR)/info-check/dark-reign/info.c
+	$(CMP) games/7legion/info.h $(BUILD_DIR)/info-check/7legion/info.h
+	$(CMP) games/7legion/info.c $(BUILD_DIR)/info-check/7legion/info.c
+	$(CMP) games/kknd/info.h $(BUILD_DIR)/info-check/kknd/info.h
+	$(CMP) games/kknd/info.c $(BUILD_DIR)/info-check/kknd/info.c
+
+# ── dark-colony-info / dark-colony-gamestat ───────────────────────────────────
+dark-colony-info: $(DC_INFO_CONV_TARGET)
+	$(DC_INFO_CONV_TARGET) --states $(sort $(wildcard $(DARK_COLONY_ROOT)/ANIMATE/*.FIN)) > $(BUILD_DIR)/dc-animations.txt
+
+dark-colony-gamestat: $(DC_GAMESTAT_GEN_TARGET)
+	$(DC_GAMESTAT_GEN_TARGET) $(DARK_COLONY_ROOT)/GAMESTAT games/dark-colony/gamestat.h
+
+# ── run targets ───────────────────────────────────────────────────────────────
+run: $(BIN_DIR)/dark-reign
+	$(BIN_DIR)/dark-reign
+
+mission-1: $(BIN_DIR)/dark-reign
+	$(BIN_DIR)/dark-reign $(DARK_REIGN_ROOT) scenario/FIXED/M01F/M01F.SCN ucfcnst0.spr
+
+mission-2: $(BIN_DIR)/dark-reign
+	$(BIN_DIR)/dark-reign $(DARK_REIGN_ROOT) scenario/FIXED/M02F/M02F.SCN ucfcnst0.spr
+
+dark-reign: $(BIN_DIR)/dark-reign
+	$(BIN_DIR)/dark-reign $(DARK_REIGN_ROOT)
+
+dark-colony: $(BIN_DIR)/dark-colony
+ifdef map
+	$(BIN_DIR)/dark-colony $(DARK_COLONY_ROOT) --map $(shell echo '$(map)' | tr '[:lower:]' '[:upper:]' | sed -E 's/^(HUMAN|ALIEN)(.*)/SCENARIO\/\1\/\1\2.MAP/')
+else
+	$(BIN_DIR)/dark-colony $(DARK_COLONY_ROOT)
+endif
+
+dark-colony-human02: $(BIN_DIR)/dark-colony
+	$(BIN_DIR)/dark-colony $(DARK_COLONY_ROOT) SCENARIO/HUMAN/HUMAN02.MAP SPRITES/TROOPER1.SPR
+
+dark-colony-human03: $(BIN_DIR)/dark-colony
+	$(BIN_DIR)/dark-colony $(DARK_COLONY_ROOT) SCENARIO/HUMAN/HUMAN03.MAP SPRITES/TROOPER1.SPR
+
+7legion: $(BIN_DIR)/7legion
+	$(BIN_DIR)/7legion data/7LEGION
+
+kknd: $(BIN_DIR)/kknd
+	$(BIN_DIR)/kknd
+
+warcraft-2: $(BIN_DIR)/warcraft-2
+	$(BIN_DIR)/warcraft-2
+
+z: $(BIN_DIR)/z
+	$(BIN_DIR)/z data/Z LEVEL01/LEVEL01.MAP
+
+# Retail data/WAR2 is not on CI. Keep test-warcraft-2 off the default test target.
+
+kknd-check: $(BIN_DIR)/kknd
+	env SDL_VIDEODRIVER=dummy $(BIN_DIR)/kknd --check
+
+anim-extract: $(ANIM_EXTRACT_TARGET)
+
+dc-spr-extract: $(DC_SPR_EXTRACT_TARGET)
+
+dc-fin-extract: $(DC_FIN_EXTRACT_TARGET)
+
+# Shared code must not name a game; see tools/check_no_game_ifdefs.sh.
+.PHONY: check-ifdefs
+check-ifdefs:
+	@tools/check_no_game_ifdefs.sh
+
+# The C catalog includes private decoders; exclude their separate objects.
+LOADER_CATALOG_SOURCES := $(sort $(shell find tests -maxdepth 1 -name 'loader_catalog.c'))
+LOADER_RUNNER_SOURCES := $(sort $(shell find tools/test_loaders -name '*.c'))
+build/test_loaders: $(LOADER_RUNNER_SOURCES)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $^ -o $@
+define LOADER_CATALOG
+$(BIN_DIR)/loader-$(1): $(LOADER_CATALOG_SOURCES) $$(filter-out %/driver/d_main.o $(BUILD_DIR)/$(1)/games/$(1)/$(3).o,$$(ALL_OBJS_$(1)))
+	$(CC) $(CPPFLAGS) -I. -Igames/$(1) $(CFLAGS) $(SDL_CFLAGS) -D$(2) $(5) -DRTS_WORLD_Y_UP=$(4) -DLOADER_FIXTURES $$^ $(SDL_LIBS) -lm -o $$@
+loader-catalogs: $(BIN_DIR)/loader-$(1)
+test-loader-$(1): $(TEST_RUNNER) $(BIN_DIR)/loader-$(1)
+	$(TEST_RUNNER) -j 1 -t $(TEST_BUDGET) $(BIN_DIR)/loader-$(1)@--fixtures
+endef
+$(eval $(call LOADER_CATALOG,dark-colony,DC,none,1,-DRTS_GAME_DARK_COLONY))
+$(eval $(call LOADER_CATALOG,dark-reign,DR,w_spr,0))
+$(eval $(call LOADER_CATALOG,7legion,SL,w_bim,0))
+$(eval $(call LOADER_CATALOG,kknd,KK,w_spr,0))
+LOADER_TEST_CASES := $(addprefix $(BIN_DIR)/loader-,dark-colony dark-reign 7legion kknd)
+test-loaders: $(TEST_RUNNER) $(LOADER_TEST_CASES)
+	$(TEST_RUNNER) -j $(TEST_JOBS) -t $(TEST_BUDGET) $(addsuffix @--fixtures,$(LOADER_TEST_CASES))
+
+test-headless: test-dark-colony
+test-ai: test-soak
+
+NETWORK_TEST_SOURCES := $(sort $(shell find tests/network -name '*.c'))
+NETWORK_TEST_OBJS := $(patsubst %.c,$(BUILD_DIR)/model-test-dark-colony/%.o,$(NETWORK_TEST_SOURCES))
+-include $(NETWORK_TEST_OBJS:.o=.d)
+$(BIN_DIR)/test_network: $(NETWORK_TEST_OBJS) $(dark-colony_TEST_ENGINE_OBJS) | $(BIN_DIR)
+	$(CC) $^ -o $@ $(SDL_LIBS) -lm
+
+.PHONY: test-network
+NETWORK_TEST_CASES := $(addprefix $(BIN_DIR)/test_network@,--commands --session --lan-discovery \
+    $(addprefix --mode-,0 1 2 3 4 5 6 7 8 9 10 11 12 13 14))
+QUICK_NETWORK_TEST_CASES := $(addprefix $(BIN_DIR)/test_network@,--commands --session --lan-discovery \
+    $(addprefix --mode-,3 4 6 12))
+test-network: $(TEST_RUNNER) $(BIN_DIR)/test_network
+	$(TEST_RUNNER) -j $(TEST_JOBS) -t $(SOAK_BUDGET) $(NETWORK_TEST_CASES)
+
+$(BIN_DIR)/test_model_commands_dark-colony: $(BUILD_DIR)/cmd-dc/$(MODEL_COMMAND_TEST_SOURCE:.c=.o) $(patsubst %.c,$(BUILD_DIR)/cmd-dc/%.o,$(MODEL_ENGINE_SOURCES) $(DC_GAME_SOURCES)) | $(BIN_DIR)
+	$(CC) $^ -o $@ $(SDL_LIBS) -lm
+
+$(BUILD_DIR)/cmd-dc/%.o: %.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -DRTS_WORLD_Y_UP=1 -DRTS_GAME_DARK_COLONY -I./games/dark-colony $(CFLAGS) $(DEPFLAGS) $(SDL_CFLAGS) -c $< -o $@
+
+$(BIN_DIR)/test_model_commands_dark-reign: $(BUILD_DIR)/cmd-dr/$(MODEL_COMMAND_TEST_SOURCE:.c=.o) $(patsubst %.c,$(BUILD_DIR)/cmd-dr/%.o,$(MODEL_ENGINE_SOURCES) $(DR_GAME_SOURCES)) | $(BIN_DIR)
+	$(CC) $^ -o $@ $(SDL_LIBS) -lm
+
+$(BUILD_DIR)/cmd-dr/%.o: %.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -DRTS_WORLD_Y_UP=0 -DRTS_GAME_DARK_REIGN -I./games/dark-reign $(CFLAGS) $(DEPFLAGS) $(SDL_CFLAGS) -c $< -o $@
+
+test-model-commands: $(TEST_RUNNER) $(BIN_DIR)/test_model_commands_dark-colony $(BIN_DIR)/test_model_commands_dark-reign
+	$(TEST_RUNNER) -j $(TEST_JOBS) -t $(TEST_BUDGET) $(BIN_DIR)/test_model_commands_dark-colony $(BIN_DIR)/test_model_commands_dark-reign
+
+help:
+	@echo "Usage: make [target]"
+	@echo ""
+	@echo "Build:"
+	@echo "  all                  Build all seven game binaries (default)"
+	@echo "  android              Build Android debug APKs (requires SDK and JDK)"
+	@echo "  clean                Remove build directory"
+	@echo ""
+	@echo "Run games:"
+	@echo "  run                  Dark Reign (multiplayer map)"
+	@echo "  dark-reign           Dark Reign (Freedom Guard Mission 01)"
+	@echo "  mission-1            Dark Reign campaign mission 1"
+	@echo "  mission-2            Dark Reign campaign mission 2"
+	@echo "  dark-colony          Dark Colony (default: HUMAN01)"
+	@echo "  dark-colony map=X    Dark Colony scenario (e.g. human02, alien03)"
+	@echo "  dark-colony-human02  Dark Colony HUMAN02 scenario"
+	@echo "  7legion              7th Legion"
+	@echo "  kknd                 KKnD"
+	@echo "  warcraft-2           Warcraft II (data/WAR2/ALAMO.PUD)"
+	@echo "  z                    Z (data/Z/LEVEL01)"
+	@echo ""
+	@echo "Tools:"
+	@echo "  dc-info-conv         Build the FIN/SPR inspector and state exporter"
+	@echo "  dc-fin-extract       Extract a Dark Colony FIN file as JSON"
+	@echo "  dark-reign-info      Regenerate Dark Reign info.c and info.h"
+	@echo "  dark-reign-units     Print retail Dark Reign UNITS.TXT stats"
+	@echo "  7legion-units        Print retail 7th Legion unit stats (legion.exe + stuff.dat)"
+	@echo "  7legion-info         Regenerate 7th Legion info.c and info.h"
+	@echo "  kknd-info            Regenerate KKnD info.c and info.h"
+	@echo ""
+	@echo "Test / check:"
+	@echo "  test                 Run quick headless tests in parallel (5s per test)"
+	@echo "  test-soak            Run full-game AI, menu animation and network stress tests"
+	@echo "  test-info-gen        Verify generated info.c and info.h files are current"
+	@echo "  kknd-check           Headless smoke check for KKnD"
+	@echo "  test-starcraft       Native asset, menu, HUD, portrait and movement checks"
+	@echo "  starcraft            Original StarCraft menu and first Terran map"
+	@echo "  starcraft-unpack     Extract local ISO and all installer/game MPQ entries"
+	@echo "  starcraft-maps       Extract installed SCM/SCX maps for multiplayer"
+	@echo "  test-warcraft-2      Worker, native HUD and PUD tests (needs data/WAR2)"
+	@echo ""
+	@echo "Smoke tests (headless):"
+	@echo "  env SDL_VIDEODRIVER=dummy build/bin/dark-colony --check"
+	@echo "  env SDL_VIDEODRIVER=dummy build/bin/dark-reign --check"
+	@echo "  env SDL_VIDEODRIVER=dummy build/bin/dark-colony --screenshot /tmp/dc.bmp"
+	@echo ""
+	@echo "Tools:"
+	@echo "  anim-extract         Build the anim_extract tool"
+	@echo "  dc-spr-extract       Build the dc_spr_extract tool (SPR → BMP sheets)"
+	@echo "  dark-colony-info     Export raw FIN state rows to build/dc-animations.txt"
+	@echo "  dark-colony-gamestat Regenerate Dark Colony gamestat.h from game data"
+
+$(BIN_DIR):
+	mkdir -p $(BIN_DIR)
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+clean:
+	rm -rf $(BUILD_DIR)
+
+
+# Headless/layout/command test objects also depend on shared runtime headers.
+-include $(sort $(shell find $(BUILD_DIR) -name '*.d' 2>/dev/null))
+
+# One-time OpenKrush economy and sidebar import; runtime uses committed C rows.
+KKND_RULES_IMPORT_SOURCES := $(sort $(shell find tools/kknd_rules_import -name '*.c'))
+build/kknd_rules_import: $(KKND_RULES_IMPORT_SOURCES)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $^ -o $@
+
+# StarCraft: native assets are unpacked locally; no MPQ dependency at runtime.
+.PHONY: starcraft starcraft-catalog starcraft-unpack starcraft-maps
+starcraft: $(BIN_DIR)/starcraft starcraft-maps
+	$(BIN_DIR)/starcraft
+starcraft-catalog: $(BIN_DIR)/starcraft
+	$(BIN_DIR)/starcraft --map catalog
+SC_IMPORT_SOURCES := $(sort $(shell find tools/sc_import -name '*.c'))
+SC_CATALOG_SOURCES := $(sort $(shell find tools/sc_catalog -name '*.c'))
+CMAKE ?= $(firstword $(wildcard reference/packages/cmake-*/CMake.app/Contents/bin/cmake) cmake)
+build/stormlib/libstorm.a: reference/StormLib/CMakeLists.txt
+	$(CMAKE) -S reference/StormLib -B build/stormlib -DSTORM_SKIP_INSTALL=ON -DCMAKE_BUILD_TYPE=Release
+	$(CMAKE) --build build/stormlib --parallel
+build/sc_import: $(SC_IMPORT_SOURCES) build/stormlib/libstorm.a
+	$(CC) $(CFLAGS) -Ireference/StormLib/src -c $(SC_IMPORT_SOURCES) -o build/sc_import.o
+	$(CXX) build/sc_import.o build/stormlib/libstorm.a -lz -lbz2 -o $@
+build/sc_catalog: $(SC_CATALOG_SOURCES)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $^ -o $@
+starcraft-unpack: build/sc_import
+	mkdir -p data/STARCRAFT/disc
+	bsdtar -xf data/STARCRAFT/StarCraft.iso -C data/STARCRAFT/disc
+	(cat reference/stargus/mpqlist.txt; printf '\nfiles\\stardat.mpq\nfiles\\broodat.mpq\n'; sed 's/^/files\\/' reference/stargus/mpqlist.txt) > build/sc-listfile.txt
+	build/sc_import data/STARCRAFT/disc/INSTALL.EXE data/STARCRAFT/install build/sc-listfile.txt
+	build/sc_import data/STARCRAFT/install/files/stardat.mpq data/STARCRAFT/native reference/stargus/mpqlist.txt
+	$(MAKE) starcraft-maps
+
+starcraft-maps: build/sc_import
+	build/sc_import --maps data/STARCRAFT/install/multimaps data/STARCRAFT/maps
+
+SC_TEST_SOURCES := $(sort $(shell find tests/starcraft -name 'test_*.c'))
+SC_TEST_BINS := $(patsubst tests/starcraft/%.c,$(BIN_DIR)/tests/starcraft/%,$(SC_TEST_SOURCES))
+$(BIN_DIR)/tests/starcraft/%: tests/starcraft/%.c $(filter-out $(BUILD_DIR)/starcraft/driver/d_main.o,$(ALL_OBJS_starcraft))
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -DRTS_WORLD_Y_UP=0 -DRTS_GAME_STARCRAFT -I./games/starcraft $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ $(SDL_LIBS) -lm
+.PHONY: test-starcraft
+test-starcraft: $(TEST_RUNNER) $(filter-out %/test_ai,$(SC_TEST_BINS)) starcraft-maps
+	$(TEST_RUNNER) -j $(TEST_JOBS) -t $(TEST_BUDGET) $(filter-out %/test_ai,$(SC_TEST_BINS))
+
+QUICK_TEST_BINS := $(filter-out %/test_ai_skirmish %/test_ai_factions %/test_menu,$(dark-colony_TEST_BINS)) \
+    $(dark-reign_TEST_BINS) $(7legion_TEST_BINS) $(kknd_TEST_BINS) \
+    $(filter-out %/test_ai %/test_ai_game,$(warcraft-2_TEST_BINS)) $(filter-out %/test_ai,$(SC_TEST_BINS)) \
+    $(z_TEST_BINS) $(BIN_DIR)/tests/dark-colony/test_menu \
+    $(BIN_DIR)/test_network $(BIN_DIR)/test_model_commands_dark-colony \
+    $(BIN_DIR)/test_model_commands_dark-reign $(DC_LAYOUT_TEST_TARGET)
+QUICK_TEST_CASES := $(filter-out $(BIN_DIR)/test_network $(BIN_DIR)/tests/dark-colony/test_menu,$(QUICK_TEST_BINS)) \
+    $(BIN_DIR)/tests/dark-colony/test_menu@--quick $(QUICK_NETWORK_TEST_CASES)
+SOAK_TEST_BINS := $(BIN_DIR)/tests/dark-colony/test_ai_skirmish \
+    $(BIN_DIR)/tests/dark-colony/test_ai_factions $(BIN_DIR)/tests/dark-colony/test_menu \
+    $(BIN_DIR)/tests/starcraft/test_ai $(BIN_DIR)/tests/warcraft-2/test_ai \
+    $(BIN_DIR)/tests/warcraft-2/test_ai_game $(BIN_DIR)/tests/z/test_ai $(BIN_DIR)/test_network
+SOAK_TEST_CASES := $(filter-out $(BIN_DIR)/test_network,$(SOAK_TEST_BINS)) $(NETWORK_TEST_CASES)
+test: check-ifdefs test-info-gen test-loaders $(TEST_RUNNER) $(QUICK_TEST_BINS) starcraft-maps
+	$(TEST_RUNNER) -j $(TEST_JOBS) -t $(TEST_BUDGET) $(QUICK_TEST_CASES)
+test-soak: $(TEST_RUNNER) $(SOAK_TEST_BINS) starcraft-maps
+	$(TEST_RUNNER) -j $(TEST_JOBS) -t $(SOAK_BUDGET) $(SOAK_TEST_CASES)

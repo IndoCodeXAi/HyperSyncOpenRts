@@ -1,0 +1,369 @@
+#define _DEFAULT_SOURCE
+#include "engine.h"
+#include "dark-reign.h"
+#include "info.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+
+static const StaticProductDefinition DARK_REIGN_FG_PRODUCTS[] = {
+#define BUILD(ui_, label_, cost_, type_, p0_, p1_) \
+    { (ui_), (ui_), (label_), (cost_), 0, RTS_PRODUCT_BUILDING, (type_), 0, \
+      { (p0_), (p1_) }, ((p1_) == 0 ? ((p0_) == 0 ? 0 : 1) : 2), { MT_FG_CONSTRUCTION_CREW }, 1, {0}, false }
+#define UNIT(ui_, label_, cost_, type_, p0_, p1_, m0_, m1_) \
+    { (ui_), (ui_), (label_), (cost_), 0, RTS_PRODUCT_UNIT, (type_), 0, \
+      { (p0_), (p1_) }, ((p1_) == 0 ? ((p0_) == 0 ? 0 : 1) : 2), \
+      { (m0_), (m1_) }, ((m1_) == 0 ? 1 : 2), {0}, false }
+#define BUILD_IMP(ui_, label_, cost_, type_, p0_, p1_) \
+    { (ui_), (ui_), (label_), (cost_), 0, RTS_PRODUCT_BUILDING, (type_), 0, \
+      { (p0_), (p1_) }, ((p1_) == 0 ? ((p0_) == 0 ? 0 : 1) : 2), { MT_IMP_CONSTRUCTION_CREW }, 1, {0}, false }
+    BUILD(10001, "FG HQ 1", 750, 10001, 0, 0),
+    BUILD(10002, "FG HQ 2", 1000, 10002, 10004, 10006),
+    BUILD(10003, "FG HQ 3", 1250, 10003, 10005, 10007),
+    BUILD(10004, "Barracks", 1500, 10004, 10001, 0),
+    BUILD(10005, "Advanced Barracks", 750, 10005, 10002, 0),
+    BUILD(10006, "Vehicle Factory", 2200, 10006, 10001, 0),
+    BUILD(10007, "Advanced Vehicle Factory", 2500, 10007, 10002, 0),
+    BUILD(10008, "Field Hospital", 500, 10008, 10004, 0),
+    BUILD(10009, "Repair Bay", 800, 10009, 10006, 0),
+    BUILD(10010, "Camera Tower", 200, 10010, 10002, 0),
+    BUILD(10011, "Rearming Deck", 1000, 10011, 10003, 0),
+    BUILD(10012, "Anti-Air Site", 1000, 10012, 10002, 0),
+    BUILD(10013, "Guard Tower", 500, 10013, 10001, 0),
+    BUILD(10014, "Advanced Guard Tower", 1700, 10014, 10002, 0),
+    BUILD(10015, "Phase Factory 1", 1200, 10015, 10001, 0),
+    BUILD(10016, "Phase Factory 2", 1200, 10016, 10002, 0),
+    BUILD(10019, "Life Plant", 2500, 10019, 0, 0),
+    BUILD(10020, "Power Plant", 2000, 10020, 0, 0),
+    BUILD(10040, "Small Horizontal Bridge", 100, 10040, 0, 0),
+    BUILD(10041, "Small Vertical Bridge", 100, 10041, 0, 0),
+    BUILD(10042, "Small Centre Bridge", 150, 10042, 0, 0),
+    { 11, 11, "Construction Rig", 300, 0, RTS_PRODUCT_UNIT, 11, 0,
+      { 10001 }, 1, { MT_FG_HQ1, MT_FG_HQ2, MT_FG_HQ3 }, 3, {0}, false },
+    UNIT(9, "Raider", 150, 9, 10004, 0, MT_FG_BARRACKS, MT_FG_ADV_BARRACKS),
+    UNIT(10, "Mercenary", 300, 10, 10004, 0, MT_FG_BARRACKS, MT_FG_ADV_BARRACKS),
+    UNIT(8, "Sniper", 700, 8, 10005, 0, MT_FG_BARRACKS, MT_FG_ADV_BARRACKS),
+    UNIT(6, "Scout", 300, 6, 10004, 0, MT_FG_BARRACKS, MT_FG_ADV_BARRACKS),
+    UNIT(7, "Medic", 500, 7, 10004, 10009, MT_FG_BARRACKS, MT_FG_ADV_BARRACKS),
+    UNIT(3, "Saboteur", 800, 3, 10005, 0, MT_FG_BARRACKS, MT_FG_ADV_BARRACKS),
+    UNIT(2, "Mechanic", 500, 2, 10004, 10009, MT_FG_BARRACKS, MT_FG_ADV_BARRACKS),
+    UNIT(5, "Martyr", 600, 5, 10004, 0, MT_FG_BARRACKS, MT_FG_ADV_BARRACKS),
+    UNIT(4, "Spy", 1000, 4, 10005, 0, MT_FG_BARRACKS, MT_FG_ADV_BARRACKS),
+    UNIT(1, "Spider Bike", 500, 1, 10006, 0, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(15, "RAT", 450, 15, 10006, 0, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(20, "Skirmish Tank", 600, 20, 10006, 0, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(17, "Tank Hunter", 700, 17, 10006, 0, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(21, "Phase Tank", 600, 21, 10006, 10015, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(12, "Flak Jack", 500, 12, 10002, 10006, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(16, "Triple Rail Tank", 1300, 16, 10007, 0, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(19, "Hellstorm Artillery", 1100, 19, 10007, 0, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(23, "Sky Bike", 800, 23, 10006, 10011, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(24, "Outrider", 1400, 24, 10006, 10011, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(18, "Shockwave", 4000, 18, 10006, 10003, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(30, "Water Contaminator", 10000, 30, 10007, 10003, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(13, "Freighter", 1000, 13, 10006, 0, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    UNIT(14, "Hover Freighter", 1500, 14, 10007, 0, MT_FG_VEHICLE_FACTORY, MT_FG_ADV_VEHICLE_FACTORY),
+    /* --- Imperium buildings (BUILD.TXT costs/prereqs, maker = Imp rig) --- */
+    BUILD_IMP(11001, "Imp HQ 1", 750, 11001, 0, 0),
+    BUILD_IMP(11002, "Imp HQ 2", 1000, 11002, 11004, 11006),
+    BUILD_IMP(11003, "Imp HQ 3", 1250, 11003, 11005, 11007),
+    BUILD_IMP(11004, "Imp Training Facility", 1500, 11004, 11001, 0),
+    BUILD_IMP(11005, "Imp Advanced Training", 750, 11005, 11002, 0),
+    BUILD_IMP(11006, "Imp Assembly Plant", 2200, 11006, 11001, 0),
+    BUILD_IMP(11007, "Imp Advanced Assembly", 2500, 11007, 11002, 0),
+    BUILD_IMP(11009, "Imp Field Hospital", 500, 11009, 11004, 0),
+    BUILD_IMP(11010, "Imp Repair Station", 800, 11010, 11006, 0),
+    BUILD_IMP(11011, "Imp Camera Tower", 200, 11011, 11002, 0),
+    BUILD_IMP(11012, "Imp Rearming Deck", 1000, 11012, 11003, 0),
+    BUILD_IMP(11013, "Imp Air Defense", 1000, 11013, 11002, 0),
+    BUILD_IMP(11014, "Imp Guard Tower", 500, 11014, 11001, 0),
+    BUILD_IMP(11015, "Imp Neutron Accelerator", 1700, 11015, 11002, 0),
+    BUILD_IMP(11008, "Imp Temporal Gate", 1800, 11008, 11002, 0),
+    BUILD_IMP(11021, "Imp Rift Creator", 8000, 11021, 11003, 11008),
+    BUILD_IMP(11019, "Imp Launch Pad", 2500, 11019, 0, 0),
+    BUILD_IMP(11020, "Imp Power Generator", 2000, 11020, 0, 0),
+    { 1005, 1005, "Imp Construction Rig", 300, 0, RTS_PRODUCT_UNIT, 1005, 0,
+      { 11001 }, 1, { MT_IMP_HQ1, MT_IMP_HQ2, MT_IMP_HQ3 }, 3, {0}, false },
+    UNIT(1002, "Guardian", 150, 1002, 11004, 0, MT_IMP_BARRACKS, MT_IMP_ADV_BARRACKS),
+    UNIT(1003, "Bion", 350, 1003, 11004, 0, MT_IMP_BARRACKS, MT_IMP_ADV_BARRACKS),
+    UNIT(1004, "Exterminator", 500, 1004, 11005, 0, MT_IMP_BARRACKS, MT_IMP_ADV_BARRACKS),
+    UNIT(1001, "Imp Spy", 1000, 1001, 11005, 0, MT_IMP_BARRACKS, MT_IMP_ADV_BARRACKS),
+    UNIT(1010, "Scout Tank", 500, 1010, 11006, 0, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1009, "Invader Transport", 600, 1009, 11006, 0, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1011, "Plasma Tank", 700, 1011, 11006, 0, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1008, "Amper", 500, 1008, 11006, 11009, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1013, "Imp MAD", 800, 1013, 11006, 11002, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1019, "Recon Drone", 400, 1019, 11006, 11002, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1015, "Shredder", 700, 1015, 11006, 0, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1014, "Hostage Taker", 600, 1014, 11007, 0, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1012, "Tachyon Tank", 1500, 1012, 11007, 0, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1017, "S.C.A.R.A.B.", 1300, 1017, 11007, 0, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1020, "Cyclone", 1500, 1020, 11006, 11012, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1018, "Sky Fortress", 2500, 1018, 11006, 11012, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1016, "Imp Contaminator", 10000, 1016, 11007, 11003, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1006, "Imp Freighter", 1000, 1006, 11006, 0, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+    UNIT(1007, "Imp Hover Freighter", 1500, 1007, 11007, 0, MT_IMP_VEHICLE_FACTORY, MT_IMP_ADV_VEHICLE_FACTORY),
+#undef BUILD
+#undef BUILD_IMP
+#undef UNIT
+};
+
+static int product_count(void) {
+    return (int)(sizeof(DARK_REIGN_FG_PRODUCTS) /
+                 sizeof(DARK_REIGN_FG_PRODUCTS[0]));
+}
+
+bool DR_ProductInTech(int type) {
+    const dr_mission_t *mission = level.mission;
+    if (!mission) return true;
+    for (int i = 0; i < mission->product_count; ++i)
+        if (mission->products[i].type == type)
+            return mission->products[i].tech_level <= mission->tech_level;
+    return false;
+}
+
+static uint16_t actor_for_native_type(int native_type) {
+    /* The Imperium towers' BUILD.TXT types stand up as UNITS.TXT turrets. */
+    switch (native_type) {
+    case ACTOR_IMP_AA_BUILDING: native_type = ACTOR_IMP_AA_SITE; break;
+    case ACTOR_IMP_GUARD_TOWER_BUILDING: native_type = ACTOR_IMP_GUARD_TOWER; break;
+    case ACTOR_IMP_ADVANCED_GUARD_TOWER_BUILDING: native_type = ACTOR_IMP_ADVANCED_GUARD_TOWER; break;
+    }
+    for (int i = 1; i < NUMMOBJTYPES; ++i)
+        if (mobjinfo[i].doomednum == native_type) return (uint16_t)i;
+    return MT_NULL;
+}
+
+uint16_t G_ModelActorIdForProduct(const StaticProductDefinition *product) {
+    return product ? actor_for_native_type(product->product_type) : MT_NULL;
+}
+
+int G_ModelBuildingFrameForProduct(const StaticProductDefinition *product) {
+    (void)product;
+    return 0;
+}
+
+int G_ModelBuildingStateForProduct(const gameinfo_t *game_info,
+                                  const StaticProductDefinition *product) {
+    (void)game_info; (void)product;
+    return -1;
+}
+
+int G_ModelProductTrainingTimeMs(const StaticProductDefinition *product) {
+    if (!product) return 0;
+    static const struct { int type; int seconds; } times[] = {
+        {10001,22},{10002,30},{10003,37},{10004,45},{10005,23},
+        {10006,66},{10007,75},{10008,15},{10009,24},{10010,6},
+        {10011,30},{10012,30},{10013,22},{10014,51},{10015,36},{10016,36},
+        {10019,37},{10020,30},{10040,3},{10041,3},{10042,5},
+        {11,9},{9,5},{10,9},{8,21},{6,9},{7,15},{3,24},{2,15},
+        {5,18},{4,30},{1,15},{15,14},{20,18},{17,21},{21,18},
+        {12,15},{16,39},{19,33},{23,24},{24,42},{18,120},{30,150},
+        {13,30},{14,45},
+        /* Imperium build times are the SetCost seconds from UNITS.TXT/BUILD.TXT. */
+        {11001,22},{11002,30},{11003,37},{11004,45},{11005,23},
+        {11006,66},{11007,75},{11009,15},{11010,24},{11011,6},
+        {11012,30},{11013,30},{11014,22},{11015,51},{11008,54},{11021,240},
+        {11019,45},{11020,30},
+        {1005,9},{1002,5},{1003,11},{1004,15},{1001,30},
+        {1010,15},{1009,18},{1011,21},{1008,15},{1013,24},
+        {1019,12},{1015,21},{1014,18},{1012,45},{1017,39},
+        {1020,45},{1018,75},{1016,150},{1006,30},{1007,45},
+    };
+    for (size_t i = 0; i < sizeof(times) / sizeof(times[0]); ++i)
+        if (times[i].type == product->product_type) return times[i].seconds * 1000;
+    return 0;
+}
+
+int G_ModelGetProducts(const RtsGameModel *model, int owner,
+                       StaticProductDefinition *out, int max_products) {
+    (void)model; (void)owner;
+    if (!out || max_products <= 0) return 0;
+    int count = product_count();
+    if (count > max_products) count = max_products;
+    memcpy(out, DARK_REIGN_FG_PRODUCTS, (size_t)count * sizeof(StaticProductDefinition));
+    return count;
+}
+
+const StaticProductDefinition *G_ModelProductByUIId(const RtsGameModel *model, int ui_id) {
+    (void)model;
+    int count = product_count();
+    for (int i = 0; i < count; ++i) {
+        if (DARK_REIGN_FG_PRODUCTS[i].ui_id == ui_id)
+            return &DARK_REIGN_FG_PRODUCTS[i];
+    }
+    return NULL;
+}
+
+const StaticProductDefinition *G_ModelProductByClassType(const RtsGameModel *model,
+                                                         int product_class,
+                                                         int product_type) {
+    (void)model;
+    int count = product_count();
+    for (int i = 0; i < count; ++i) {
+        if ((int)DARK_REIGN_FG_PRODUCTS[i].product_class == product_class &&
+            DARK_REIGN_FG_PRODUCTS[i].product_type == product_type)
+            return &DARK_REIGN_FG_PRODUCTS[i];
+    }
+    return NULL;
+}
+
+/* OpenDR upgrades retain the producer's base prerequisite. Our upgraded
+ * buildings have separate mobj types, so include their lower tiers here. */
+static bool has_prerequisite(const RtsGameModel *model, int owner, int type) {
+    if (G_ModelHasActorType(model, owner, actor_for_native_type(type))) return true;
+    switch (type) {
+    case 10001:
+        if (G_ModelHasActorType(model, owner, MT_FG_HQ2)) return true;
+        /* fall through */
+    case 10002: return G_ModelHasActorType(model, owner, MT_FG_HQ3);
+    case 10004: return G_ModelHasActorType(model, owner, MT_FG_ADV_BARRACKS);
+    case 10006: return G_ModelHasActorType(model, owner, MT_FG_ADV_VEHICLE_FACTORY);
+    case 10015: return G_ModelHasActorType(model, owner, MT_FG_PHASE_FACTORY_2);
+    case 11001:
+        if (G_ModelHasActorType(model, owner, MT_IMP_HQ2)) return true;
+        /* fall through */
+    case 11002: return G_ModelHasActorType(model, owner, MT_IMP_HQ3);
+    case 11004: return G_ModelHasActorType(model, owner, MT_IMP_ADV_BARRACKS);
+    case 11006: return G_ModelHasActorType(model, owner, MT_IMP_ADV_VEHICLE_FACTORY);
+    default: return false;
+    }
+}
+
+bool DR_PrerequisiteMet(int owner, int id) { return has_prerequisite(NULL, owner, id); }
+
+bool G_ModelProductAvailable(const RtsGameModel *model, int owner,
+                             const StaticProductDefinition *product) {
+    if (!product || !DR_ProductInTech(product->ui_id)) return false;
+    for (int i = 0; i < product->prerequisite_count; ++i) {
+        if (!has_prerequisite(model, owner, product->prerequisites[i]))
+            return false;
+    }
+    if (product->maker_count <= 0) return true;
+    for (int i = 0; i < product->maker_count; ++i) {
+        if (G_ModelHasActorType(model, owner,
+                                (uint16_t)product->makers[i]))
+            return true;
+    }
+    return false;
+}
+
+bool G_ModelStartProductionRelease(RtsGameModel *model, mobj_t *producer,
+                                   const StaticProductDefinition *product,
+                                   uint16_t actor_id) {
+    (void)model; (void)producer; (void)product; (void)actor_id;
+    return false;
+}
+
+bool G_ModelSpecialReleaseSpawnPoint(const RtsGameModel *model, const mobj_t *producer,
+                                     const StaticProductDefinition *product,
+                                     const mobj_t *new_unit,
+                                     fixed2_t *out) {
+    (void)model; (void)producer; (void)product; (void)new_unit; (void)out;
+    return false;
+}
+
+static void append_ui_script(char *dst, size_t dst_size, const char *fmt, ...) {
+    if (!dst || dst_size == 0) return;
+    size_t len = strlen(dst);
+    if (len >= dst_size - 1) return;
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(dst + len, dst_size - len, fmt, args);
+    va_end(args);
+}
+
+void G_ModelBuildUIScript(const RtsGameModel *model,
+                          const RtsRenderSnapshot *snapshot,
+                          char *dst, size_t dst_size) {
+    if (!model || !snapshot || !dst || dst_size == 0) return;
+    dst[0] = '\0';
+
+    append_ui_script(dst, dst_size, "ui dark-reign 1\n");
+    append_ui_script(dst, dst_size, "x 216 y 5 text \"Taelon %d\"\n",
+                     snapshot->player_resources[consoleplayer][0]);
+
+    int selected_idx = -1;
+    for (int i = 0; i < snapshot->unit_count; ++i) {
+        if (snapshot->units[i].selected && snapshot->units[i].owner == consoleplayer) {
+            selected_idx = i;
+            break;
+        }
+    }
+    if (selected_idx < 0) return;
+
+    uint16_t producer_type = snapshot->units[selected_idx].type_id;
+    int button_index = 0;
+    int available_product_count = product_count();
+    for (int i = 0; i < available_product_count; ++i) {
+        const StaticProductDefinition *product = &DARK_REIGN_FG_PRODUCTS[i];
+        bool is_maker = false;
+        for (int m = 0; m < product->maker_count; ++m) {
+            if (product->makers[m] == (int)producer_type) {
+                is_maker = true;
+                break;
+            }
+        }
+        if (!is_maker) continue;
+
+        int col = button_index % 3;
+        int row = button_index / 3;
+        /* The HUD's grid of 64x50 slots at (448,64). */
+        int button_x = 448 + col * 64;
+        int button_y = 64 + row * 50;
+        button_index++;
+        bool available = G_ModelProductAvailable(model, consoleplayer, product) &&
+                         snapshot->player_resources[consoleplayer][0] >= product->cost;
+        append_ui_script(dst, dst_size,
+                         "x %d y %d btn %d enabled %d pic %d\n",
+                         button_x, button_y, product->ui_id, available ? 1 : 0,
+                         product->icon_frame);
+    }
+}
+
+bool G_PlayerBuildProduct(mobj_t *producer, const StaticProductDefinition *product) {
+    return G_QueueProduct(producer, product);
+}
+
+bool G_ModelProducerHasTech(const mobj_t *producer, const StaticProductDefinition *product) {
+    (void)producer; (void)product;
+    return true;
+}
+
+int G_ModelRadarLevel(int owner) {
+    (void)owner;
+    return 2;
+}
+
+static const AiGameInterface dr_ai_interface = {
+    .name = "dark-reign",
+    .features = AI_FEATURE_ECONOMY | AI_FEATURE_PRODUCTION |
+                AI_FEATURE_DEFENSE | AI_FEATURE_ATTACK | AI_FEATURE_DOCTRINE,
+    .player_level = P_AiLevelNonHuman,
+    .is_anchor = G_AiIsStructure,
+};
+
+const AiGameInterface *G_AiInterface(void) { return &dr_ai_interface; }
+
+bool DR_HarvestDropoffMatches(const mobj_t *unit,
+                              int resource_type, const mobj_t *base,
+                              fixed2_t *position) {
+    (void)unit;
+    const dr_mission_t *mission = level.mission;
+    if (!mission || !base || base->type_id >= gameinfo->mobj_type_count) return false;
+    ivec2_t bay = mission->bays[base->type_id];
+    if (bay.x < 0 || bay.y < 0) return false;
+    *position = fixed2_add(fixed3_xy(base->core.position), fixed2_cell_center(bay));
+
+    switch (resource_type) {
+        case 0:
+            return base->type_id == MT_FG_LIFE_PLANT ||
+                   base->type_id == MT_IMP_LIFE_PLANT;
+        case 1:
+            return base->type_id == MT_FG_POWER_PLANT ||
+                   base->type_id == MT_IMP_POWER_PLANT;
+        default:
+            return false;
+    }
+}

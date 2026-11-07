@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach builds to
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    uses: ./.github/workflows/android.yml
+    with:
+      tag: ${{ github.event.release.tag_name || inputs.tag }}
+    secrets: inherit
+
+  upload-android:
+    name: Publish Android APKs
+    needs: android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: open-rts-*-android
+          merge-multiple: true
+          path: dist
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -eu
+          files=(dist/*.apk)
+          test "${#files[@]}" -eq 7
+          gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-15
+          - platform: linux-x64
+            runner: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: rel
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag="${{ github.event.release.tag_name }}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.rel.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Require Apple Silicon
+        if: matrix.platform == 'macos-arm64'
+        run: test "$(uname -m)" = arm64
+
+      - name: Require x86_64
+        if: matrix.platform == 'linux-x64'
+        run: test "$(uname -m)" = x86_64
+
+      - name: Install SDL2 (macOS)
+        if: matrix.platform == 'macos-arm64'
+        run: |
+          set -eu
+          # Homebrew's sdl2 formula is sdl2-compat over SDL3. Packaged
+          # --check on the macOS runner never returned with that library.
+          # Bundle classic SDL 2.32, the library local development uses.
+          ver=2.32.10
+          prefix="$RUNNER_TEMP/sdl2"
+          curl -fsSL -o "$RUNNER_TEMP/SDL2.tar.gz" \
+            "https://github.com/libsdl-org/SDL/releases/download/release-${ver}/SDL2-${ver}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/SDL2.tar.gz" -C "$RUNNER_TEMP"
+          cmake -S "$RUNNER_TEMP/SDL2-${ver}" -B "$RUNNER_TEMP/sdl2-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$prefix" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST=OFF
+          cmake --build "$RUNNER_TEMP/sdl2-build" -j"$(sysctl -n hw.ncpu)"
+          cmake --install "$RUNNER_TEMP/sdl2-build"
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
+          echo "sdl2 $(pkg-config --modversion sdl2): $(pkg-config --libs sdl2)"
+          if pkg-config --libs sdl2 | grep -q SDL2main; then
+            echo "classic SDL2 pkg-config must not add SDL2main" >&2
+            exit 1
+          fi
+          test -f "$prefix/lib/libSDL2-2.0.0.dylib"
+
+      - name: Install SDL2 (Linux)
+        if: matrix.platform == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libsdl2-dev patchelf
+
+      - name: Build
+        run: |
+          if [ "$(uname)" = Darwin ]; then
+            jobs=$(sysctl -n hw.ncpu)
+            echo "sdl2 $(pkg-config --modversion sdl2): $(pkg-config --libs sdl2)"
+          else
+            jobs=$(nproc)
+          fi
+          make -j"$jobs"
+
+      - name: Package
+        run: /bin/bash .github/scripts/package-release.sh ${{ matrix.platform }}
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*.zip dist/*.tar.gz)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no archives produced" >&2
+            exit 1
+          fi
+          ls -lh "${files[@]}"
+          gh release upload "${{ steps.rel.outputs.tag }}" "${files[@]}" --clobber

@@ -1,0 +1,327 @@
+#include "t_local.h"
+#include "warcraft-2.h"
+#include "info.h"
+#include "w2_local.h"
+#include "../../play/p_nav.h"
+
+#define CHECK(c) RTS_CHECK(c, "Warcraft II navy", #c)
+
+static mobj_t *spawn(int type, fixed2_t at) {
+    mobj_t *unit = P_SpawnMobj(fixed3_from_fixed2(at, 0), type);
+    assert(unit);
+    unit->owner = unit->team = 0;
+    unit->allegiance = ALLEGIANCE_PLAYER;
+    unit->traits |= MF_NOAUTOTARGET;
+    return unit;
+}
+
+static void fixture(void) {
+    P_FreeLevel(&level); P_InitThinkers(); G_InitGame();
+    consoleplayer = 0; leveltime = 1;
+    level.width = level.height = 32;
+    level.tile_ids = calloc(1024, sizeof(*level.tile_ids));
+    level.blocked = calloc(1024, 1);
+    level.cell_solid = calloc(1024, 1);
+    level.cell_terrain = calloc(1024, 1);
+    level.speeds = calloc(1, sizeof(*level.speeds));
+    level.speeds->class_count = 5;
+    level.speeds->terrain[1][0] = 100;
+    level.speeds->terrain[2][1] = 100;
+    level.speeds->terrain[4][1] = level.speeds->terrain[4][3] = 100;
+    level.speeds->footprint[2] = level.speeds->footprint[4] = 2;
+    for (int y = 0; y < 32; ++y) for (int x = 10; x < 32; ++x) {
+        level.cell_terrain[L_Index(&level, x, y)] = x == 10 ? 3 : 1;
+        level.blocked[L_Index(&level, x, y)] = 1;
+    }
+    for (int r = 0; r < 3; ++r) level.player_resources[0][r] = 10000;
+}
+
+static bool on_corner(fixed2_t at) {
+    return !(at.x & (FIXED_ONE - 1)) && !(at.y & (FIXED_ONE - 1));
+}
+
+static mobj_t *find_type(int type) {
+    for (thinker_t *th = thinkercap.next; th != &thinkercap; th = th->next) {
+        mobj_t *unit = (mobj_t *)th;
+        if (th->function == P_MobjThinker && !unit->remove && unit->hp > 0 && unit->type_id == type)
+            return unit;
+    }
+    return NULL;
+}
+
+static int launch(int side) {
+    fixture();
+    spawn(MT_FARM + side, FIXED2_LIT(3, 3));
+    mobj_t *yard = spawn(MT_HUMAN_SHIPYARD + side, FIXED2_LIT(11.5, 5.5));
+    w2_mark_footprint(10, 4, (isize2_t){3, 3});
+    const StaticProductDefinition *product = G_ModelProductByClassType(NULL, RTS_PRODUCT_UNIT, MT_HUMAN_OIL_TANKER + side);
+    CHECK(product && G_PlayerBuildProduct(yard, product));
+    G_ProductionTicker(20000);
+    mobj_t *tanker = find_type(MT_HUMAN_OIL_TANKER + side);
+    CHECK(tanker);
+    fixed2_t at = fixed3_xy(tanker->core.position);
+    CHECK(P_CheckPosition(&level, tanker, at));
+    CHECK(on_corner(at));
+    CHECK(level.cell_terrain[L_Index(&level, fixed_floor_int(at.x), fixed_floor_int(at.y))] == 1);
+    CHECK(!P_CheckPosition(&level, tanker, FIXED2_LIT(8.5, 8.5)));
+    CHECK(!P_CheckPosition(&level, tanker, FIXED2_LIT(10.5, 8.5)));
+    CHECK(P_MoveUnitTo(&level, tanker, FIXED2_LIT(18.5, 9.5)));
+    for (int i = 0; i < 1000 && P_HasMoveOrder(tanker); ++i) P_Ticker();
+    CHECK(fixed2_near(fixed3_xy(tanker->core.position), FIXED2_LIT(18.5, 9.5), FIXED_LIT(0.01)));
+    mobj_t *patch = spawn(MT_OIL_PATCH, FIXED2_LIT(22.5, 9.5));
+    patch->owner = patch->team = 15; patch->allegiance = ALLEGIANCE_NEUTRAL;
+    level.resource_vents = calloc(1, sizeof(*level.resource_vents));
+    level.resource_vent_count = 1;
+    resourcevent_t *vent = level.resource_vents;
+    *vent = (resourcevent_t){.cell = {21, 8}, .footprint = {3, 3}, .attachment = FIXED2_LIT(22.5, 9.5),
+        .amount = 250, .resource_type = 2, .source_id = patch->id, .active = true};
+    w2_mark_footprint(21, 8, vent->footprint);
+    CHECK(!W2_HarvestOrder(tanker, vent->attachment));
+    CHECK(W2_ConstructOrder(tanker, MT_HUMAN_OIL_PLATFORM + side, vent->cell));
+    for (int i = 0; i < 3000 && !tanker->w2.site; ++i) P_Ticker();
+    mobj_t *platform = P_MobjById(vent->source_id);
+    CHECK(platform && W2_UnderConstruction(platform));
+    CHECK(states[platform->core.state_id].sprite == W2_NAVAL_SITE_SPRITE + 2 + side);
+    CHECK(!P_VentOpenTo(&level, vent, tanker));
+    for (int i = 0; i < 2000 && W2_UnderConstruction(platform); ++i) P_Ticker();
+    CHECK(!W2_UnderConstruction(platform) && tanker->harvest.phase != HARVEST_PHASE_NONE);
+    level.player_resources[0][2] = 0;
+    bool pumping = false, loaded = false;
+    for (int i = 0; i < 5000 && !level.player_resources[0][2]; ++i) {
+        P_Ticker();
+        if (tanker->harvest.phase == HARVEST_PHASE_MINING || tanker->harvest.phase == HARVEST_PHASE_UNLOADING)
+            CHECK(on_corner(fixed3_xy(tanker->core.position)));
+        pumping |= platform->core.frame == 2;
+        loaded |= states[tanker->core.state_id].sprite == W2_TANK_FULL_SPRITE + side;
+    }
+    CHECK(pumping && loaded);
+    CHECK(level.player_resources[0][2] == 100 && vent->amount == 150);
+    mobj_t *refinery = spawn(MT_HUMAN_REFINERY + side, FIXED2_LIT(11.5, 17.5));
+    w2_mark_footprint(10, 16, (isize2_t){3, 3});
+    refinery->w2.build_left_tics = 1;
+    CHECK(W2_ResourceIncome(0, 2) == 100);
+    refinery->w2.build_left_tics = 0;
+    CHECK(W2_ResourceIncome(0, 2) == 125);
+    for (int i = 0; i < 8000 && vent->active; ++i) P_Ticker();
+    CHECK(!vent->active && vent->amount == 0 && !P_MobjById(vent->source_id));
+    for (int i = 0; i < 4000 && tanker->harvest.cargo; ++i) P_Ticker();
+    CHECK(level.player_resources[0][2] == 287 && !tanker->harvest.cargo);
+    CHECK(P_CheckPosition(&level, tanker, FIXED2_LIT(22.5, 9.5)));
+    return 0;
+}
+
+static int shore(void) {
+    fixture();
+    mobj_t *worker = spawn(MT_PEASANT, FIXED2_LIT(8.5, 5.5));
+    CHECK(!W2_CanPlace(MT_HUMAN_SHIPYARD, (ivec2_t){7, 4}, worker));
+    CHECK(W2_CanPlace(MT_HUMAN_SHIPYARD, (ivec2_t){10, 4}, worker));
+    CHECK(!W2_CanPlace(MT_HUMAN_SHIPYARD, (ivec2_t){11, 4}, worker));
+    CHECK(!W2_CanPlace(MT_FARM, (ivec2_t){10, 4}, worker));
+    CHECK(!W2_CanPlace(MT_HUMAN_SHIPYARD, (ivec2_t){10, -1}, worker));
+    mobj_t *patch = spawn(MT_OIL_PATCH, FIXED2_LIT(16.5, 5.5));
+    CHECK(!W2_CanPlace(MT_HUMAN_SHIPYARD, (ivec2_t){10, 4}, worker));
+    patch->core.position = fixed3_from_fixed2(FIXED2_LIT(17.5, 5.5), 0);
+    CHECK(W2_CanPlace(MT_HUMAN_SHIPYARD, (ivec2_t){10, 4}, worker));
+    P_RemoveMobj(patch);
+    /* A shipyard needs a lumber mill (Wargus upgrade.lua). */
+    CHECK(!W2_ConstructOrder(worker, MT_HUMAN_SHIPYARD, (ivec2_t){10, 4}));
+    mobj_t *mill = spawn(MT_ELVEN_LUMBER_MILL, FIXED2_LIT(2.5, 12.5));
+    CHECK(mill);
+    CHECK(W2_ConstructOrder(worker, MT_HUMAN_SHIPYARD, (ivec2_t){10, 4}));
+    for (int i = 0; i < 3000; ++i) P_Ticker();
+    mobj_t *yard = find_type(MT_HUMAN_SHIPYARD);
+    CHECK(yard && !W2_UnderConstruction(yard));
+    mobj_t *transport = spawn(MT_HUMAN_TRANSPORT, FIXED2_LIT(13.5, 12.5));
+    /* A transport covers 2x2 tiles: beached on the coast column, it stands on a corner. */
+    CHECK(P_CheckPosition(&level, transport, FIXED2_LIT(11, 13)));
+    CHECK(!P_CheckPosition(&level, transport, FIXED2_LIT(10.5, 12.5)));
+    CHECK(!P_CheckPosition(&level, transport, FIXED2_LIT(10, 13)));
+    CHECK(P_MoveUnitTo(&level, transport, FIXED2_LIT(11, 13)));
+    for (int i = 0; i < 1000 && P_HasMoveOrder(transport); ++i) P_Ticker();
+    CHECK(fixed2_near(fixed3_xy(transport->core.position), FIXED2_LIT(11, 13), FIXED_LIT(0.01)));
+    mobj_t *passenger = spawn(MT_FOOTMAN, FIXED2_LIT(9.5, 12.5));
+    CHECK(W2_BoardOrder(passenger, transport));
+    P_Ticker(); CHECK(passenger->w2.boarded);
+    CHECK(W2_UnloadOrder(transport, fixed3_xy(transport->core.position)));
+    for (int i = 0; i < 10; ++i) P_Ticker();
+    CHECK(!passenger->w2.boarded);
+    fixed2_t at = fixed3_xy(passenger->core.position);
+    CHECK(P_CheckPosition(&level, passenger, at));
+    return 0;
+}
+
+static int fleet(int side) {
+    const int types[] = {MT_HUMAN_TRANSPORT, MT_HUMAN_DESTROYER, MT_BATTLESHIP, MT_GNOMISH_SUBMARINE};
+    for (int i = 0; i < 4; ++i) {
+        fixture();
+        spawn(MT_FARM + side, FIXED2_LIT(3, 3));
+        spawn(MT_HUMAN_FOUNDRY + side, FIXED2_LIT(5, 3));
+        spawn(MT_INVENTOR + side, FIXED2_LIT(5, 6));
+        mobj_t *yard = spawn(MT_HUMAN_SHIPYARD + side, FIXED2_LIT(11.5, 5.5));
+        w2_mark_footprint(10, 4, (isize2_t){3, 3});
+        int type = types[i] + side;
+        const StaticProductDefinition *product = G_ModelProductByClassType(NULL, RTS_PRODUCT_UNIT, type);
+        int oil = level.player_resources[0][2];
+        CHECK(product && G_PlayerBuildProduct(yard, product));
+        CHECK(level.player_resources[0][2] == oil - mobjinfo[type].w2.costs.resources[2]);
+        G_ProductionTicker(30000);
+        mobj_t *ship = find_type(type);
+        CHECK(ship);
+        fixed2_t at = fixed3_xy(ship->core.position);
+        CHECK(P_CheckPosition(&level, ship, at));
+        CHECK(on_corner(at));
+        if (i > 0) {
+            ship->core.position = fixed3_from_fixed2(FIXED2_LIT(18.5, 12.5), 0);
+            mobj_t *target = spawn(MT_ORC_OIL_TANKER - side, FIXED2_LIT(21.5, 12.5));
+            target->owner = target->team = 1; target->allegiance = ALLEGIANCE_ENEMY;
+            target->max_hp = target->hp = 10000;
+            ship->attack.target = target;
+            CHECK(P_SetMobjState(ship, mobjinfo[type].missilestate));
+            if (i < 3) CHECK(ship->core.frame == 0);
+            for (int t = 0; t < 80; ++t) {
+                P_Ticker();
+                if (i < 3) CHECK(ship->core.frame == 0);
+            }
+            CHECK(target->hp < 10000);
+        }
+        uint32_t id = ship->id;
+        P_DamageMobj(ship, NULL, ship->hp);
+        if (i < 3) {
+            CHECK(ship->core.frame == 1 && states[ship->core.state_id].group == W2_GROUP_DEATH);
+            for (int t = 0; t < 50; ++t) P_Ticker();
+            CHECK(ship->core.frame == 2);
+        }
+        for (int t = 0; t < 60; ++t) P_Ticker();
+        CHECK(!P_MobjById(id));
+    }
+    return 0;
+}
+
+/* Ships cover 2x2 tiles: they plan, sail and dock on tile corners, need a
+ * channel two tiles wide, and land units still use tile centres. */
+static int corners(void) {
+    fixture();
+    mobj_t *ship = spawn(MT_HUMAN_DESTROYER, FIXED2_LIT(14, 10));
+    mobj_t *foot = spawn(MT_FOOTMAN, FIXED2_LIT(4.5, 4.5));
+    int sea = P_MobjMoveClass(ship), land = P_MobjMoveClass(foot);
+    CHECK(P_NavFootprint(&level, sea) == 2 && P_NavFootprint(&level, land) == 1);
+    CHECK(fixed2_near(P_NavNodePoint(&level, sea, (ivec2_t){14, 10}), FIXED2_LIT(14, 10), 1));
+    CHECK(ivec2_equal(P_NavNodeAt(&level, sea, FIXED2_LIT(14.4, 9.6)), (ivec2_t){14, 10}));
+    CHECK(fixed2_near(P_NavNodePoint(&level, land, (ivec2_t){4, 4}), FIXED2_LIT(4.5, 4.5), 1));
+    CHECK(ivec2_equal(P_NavNodeAt(&level, land, FIXED2_LIT(4.9, 4.1)), (ivec2_t){4, 4}));
+    ivec2_t ring[64];
+    /* A 3x3 footprint: twenty corners, (20, 7) to (25, 12), hold a hull touching it. */
+    int count = P_NavRing(&level, sea, (ivec2_t){21, 8}, (isize2_t){3, 3}, ring, 64);
+    CHECK(count == 20 && ivec2_equal(ring[0], (ivec2_t){20, 7}) && ivec2_equal(ring[count - 1], (ivec2_t){25, 12}));
+    CHECK(P_NavRing(&level, land, (ivec2_t){21, 8}, (isize2_t){3, 3}, ring, 64) == 16);
+
+    /* A reef at x = 20 with a one-tile gap: too narrow for a ship. */
+    for (int y = 0; y < 32; ++y) level.cell_solid[L_Index(&level, 20, y)] = y != 10;
+    CHECK(!P_NavReachable(&level, sea, (ivec2_t){14, 10}, (ivec2_t){26, 11}));
+    level.cell_solid[L_Index(&level, 20, 11)] = 0;
+    CHECK(P_NavReachable(&level, sea, (ivec2_t){14, 10}, (ivec2_t){26, 11}));
+    navpath_t path;
+    CHECK(P_NavPlan(&level, sea, P_MobjRadius(ship), FIXED2_LIT(14, 10), FIXED2_LIT(26, 11), NULL, &path));
+    CHECK(path.complete && fixed2_near(path.goal, FIXED2_LIT(26, 11), 1));
+    for (int i = 0; i < path.count; ++i) CHECK(on_corner(path.points[i]));
+    CHECK(P_MoveUnitTo(&level, ship, FIXED2_LIT(26, 11)));
+    for (int i = 0; i < 1500 && P_HasMoveOrder(ship); ++i) {
+        P_Ticker();
+        CHECK(P_CheckPosition(&level, ship, fixed3_xy(ship->core.position)));
+    }
+    CHECK(fixed2_near(fixed3_xy(ship->core.position), FIXED2_LIT(26, 11), FIXED_LIT(0.01)));
+    /* An off-grid order settles on the nearest corner the hull fits. */
+    CHECK(P_MoveUnitTo(&level, ship, FIXED2_LIT(31.5, 20.5)));
+    CHECK(fixed2_near(ship->movement.goal, FIXED2_LIT(31, 21), 1));
+
+    /* Docking beside a 3x3 oil patch puts the hull on a corner next to it. */
+    for (int y = 0; y < 32; ++y) level.cell_solid[L_Index(&level, 20, y)] = 0;
+    mobj_t *tanker = spawn(MT_HUMAN_OIL_TANKER, FIXED2_LIT(16, 4));
+    w2_mark_footprint(21, 8, (isize2_t){3, 3});
+    fixed2_t bay;
+    CHECK(P_ApproachFootprint(tanker, (ivec2_t){21, 8}, (isize2_t){3, 3}, &bay));
+    CHECK(on_corner(bay) && fixed2_near(bay, FIXED2_LIT(20, 7), 1)); /* the nearest, diagonal, corner */
+    CHECK(P_CheckPosition(&level, tanker, bay));
+
+    /* A ship launched from a shipyard leaves on a corner. */
+    fixture();
+    spawn(MT_FARM, FIXED2_LIT(3, 3));
+    mobj_t *yard = spawn(MT_HUMAN_SHIPYARD, FIXED2_LIT(11.5, 5.5));
+    w2_mark_footprint(10, 4, (isize2_t){3, 3});
+    const StaticProductDefinition *product = G_ModelProductByClassType(NULL, RTS_PRODUCT_UNIT, MT_HUMAN_DESTROYER);
+    CHECK(product && G_PlayerBuildProduct(yard, product));
+    G_ProductionTicker(30000);
+    mobj_t *built = find_type(MT_HUMAN_DESTROYER);
+    CHECK(built && on_corner(fixed3_xy(built->core.position)));
+    CHECK(P_CheckPosition(&level, built, fixed3_xy(built->core.position)));
+    return 0;
+}
+
+/* Native contact sheet: each era/faction row is empty tanker, loaded tanker,
+ * the two well construction stages, idle platform, pumping platform. */
+static int native_art(const char *path) {
+    w2_archive_t arc;
+    CHECK(w2_archive_open(&arc, "data/WAR2/DATA/MAINDAT.WAR"));
+    SDL_Surface *image = path ? SDL_CreateRGBSurfaceWithFormat(0, 672, 896, 32, SDL_PIXELFORMAT_ARGB8888) : NULL;
+    if (path) { CHECK(image); SDL_FillRect(image, NULL, 0xff304858); }
+    for (int era = 0; era < 4; ++era) {
+        spritecache_t cache = {0};
+        w2_blob_t blob = {0};
+        uint32_t palette[256];
+        CHECK(w2_archive_extract(&arc, w2_era_palette(era), &blob) && w2_decode_palette(&blob, palette));
+        w2_blob_free(&blob);
+        CHECK(w2_load_shared_sprites(&arc, palette, era, &cache));
+        for (int side = 0; side < 2; ++side) {
+            spritesheet_t empty = {0}, platform = {0};
+            CHECK(w2_archive_extract(&arc, 59 + side, &blob) && w2_decode_grp(&blob, palette, &empty, true, NULL));
+            w2_blob_free(&blob);
+            int entry = w2_grp_entry(&mobjinfo[MT_HUMAN_OIL_PLATFORM + side], era, arc.count);
+            CHECK(w2_archive_extract(&arc, entry, &blob) && w2_decode_grp(&blob, palette, &platform, false, NULL));
+            w2_blob_free(&blob);
+            const cachedsprite_t *full = R_CacheFind(&cache, sprnames[W2_TANK_FULL_SPRITE + side]);
+            const cachedsprite_t *site = R_CacheFind(&cache, sprnames[W2_NAVAL_SITE_SPRITE + 2 + side]);
+            CHECK(full && site && full->sprite.spritedef.numframes == 3 && site->sprite.numlumps >= 2 && platform.numlumps == 3);
+            CHECK(full->sprite.spritedef.spriteframes[0].rotations == 8);
+            for (int building = 0; building < 8; ++building) {
+                const cachedsprite_t *art = R_CacheFind(&cache, sprnames[W2_NAVAL_SITE_SPRITE + building]);
+                CHECK(art && art->sprite.numlumps >= 2);
+            }
+            if (image) {
+                const spritesheet_t *sheets[] = {&empty, &full->sprite, &site->sprite, &site->sprite, &platform, &platform};
+                const int cells[] = {2, 2, 0, 1, 0, 2};
+                for (int col = 0; col < 6; ++col) {
+                    const spritesheet_t *sheet = sheets[col];
+                    const spritecell_t *cell = &sheet->cells[cells[col]];
+                    CHECK(cell->rect.w <= 112 && cell->rect.h <= 112);
+                    for (int y = 0; y < cell->rect.h; ++y) for (int x = 0; x < cell->rect.w; ++x) {
+                        uint8_t ink = sheet->lumps[cells[col]].indices[y * cell->rect.w + x];
+                        if (!ink) continue;
+                        int dx = col * 112 + (112 - cell->rect.w) / 2 + x;
+                        int dy = (era * 2 + side) * 112 + (112 - cell->rect.h) / 2 + y;
+                        ((uint32_t *)((uint8_t *)image->pixels + dy * image->pitch))[dx] = sheet->palette[ink];
+                    }
+                }
+            }
+            R_FreeSprite(&empty); R_FreeSprite(&platform);
+        }
+        R_FreeSpriteCache(&cache);
+    }
+    if (image) {
+        SDL_Surface *rgb = SDL_ConvertSurfaceFormat(image, SDL_PIXELFORMAT_RGB24, 0);
+        CHECK(rgb && SDL_SaveBMP(rgb, path) == 0);
+        SDL_FreeSurface(rgb); SDL_FreeSurface(image);
+    }
+    w2_archive_close(&arc);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    RTS_RUN(launch(0)); RTS_RUN(launch(1));
+    RTS_RUN(shore());
+    RTS_RUN(corners());
+    RTS_RUN(fleet(0)); RTS_RUN(fleet(1));
+    RTS_RUN(native_art(argc > 1 ? argv[1] : NULL));
+    P_FreeLevel(&level);
+    puts("PASS: both navies launch, move, build platforms, gather oil, refine and exhaust reserves; shoreline placement; 2x2 hulls on tile corners");
+    return 0;
+}

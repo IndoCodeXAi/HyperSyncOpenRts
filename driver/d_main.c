@@ -1,0 +1,740 @@
+#define _DEFAULT_SOURCE
+#include "engine.h"
+
+#include <ctype.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
+
+static const mobjtype_t *driver_actor_type_by_id(uint16_t type_id) {
+    const mobjtype_t *types = (const mobjtype_t *)actor_types;
+    if (!types) return NULL;
+    for (int i = 0; i < num_actor_types; ++i) {
+        if (types[i].id == type_id) return &types[i];
+    }
+    return NULL;
+}
+
+static const mobjtype_t *actor_type_for_unit(const mobj_t *unit) {
+    const mobjtype_t *type = driver_actor_type_by_id(unit ? unit->type_id : 0);
+    if (type) return type;
+    const mobjtype_t *types = (const mobjtype_t *)actor_types;
+    if (!types || !unit) return NULL;
+    for (int i = 0; i < num_actor_types; ++i) {
+        const char *sprite = types[i].sprite_name;
+        if (sprite && sprite[0] != '\0' && strcasecmp(sprite, unit->core.sprite_name) == 0) {
+            return &types[i];
+        }
+    }
+    return num_actor_types > 0 ? &types[0] : NULL;
+}
+
+static void apply_actor_defaults(mobj_t *const *units, int count) {
+    for (int i = 0; i < count; ++i) {
+        P_ApplyActorTypeDefaults(units[i], actor_type_for_unit(units[i]));
+        P_InitMobj(gameinfo, units[i]);
+    }
+}
+
+static bool spawn_debug_enemy_unit(const level_t *map, const app_t *app,
+                                   int sx, int sy) {
+    if (!map || !app) return false;
+    const mobjtype_t *type = driver_actor_type_by_id(g_debug_enemy_type);
+    const mobjtype_t *types = (const mobjtype_t *)actor_types;
+    if (!type && num_actor_types > 0) type = &types[0];
+    if (!type) return false;
+    cell_t cell = R_ScreenToMapGrid(app, map, sx, sy);
+    if (!L_Contains(map, cell.x, cell.y)) return false;
+    mobj_t *unit = P_SpawnMobj(fixed3_zero(), type->id);
+    if (!unit) return false;
+    unit->core.position = fixed3_with_xy(unit->core.position,
+        fixed2_cell_center((ivec2_t){ cell.x, cell.y }));
+    unit->owner = 1;
+    unit->team = 1;
+    unit->core.angle = direction_to_angle(12, 32, ANG90, true);
+    P_ApplyActorTypeDefaults(unit, type);
+    P_InitMobj(gameinfo, unit);
+    return true;
+}
+
+static bool focus_camera_on_first_player_unit(app_t *app, const level_t *map,
+                                              mobj_t *const *units, int unit_count) {
+    if (!app || !map || !units) return false;
+    for (int i = 0; i < unit_count; ++i) {
+        if (units[i]->owner != consoleplayer || units[i]->remove || units[i]->hp <= 0) continue;
+        float sx = 0.0f, sy = 0.0f;
+        fvec2_t position = fixed3_xy_to_fvec2(units[i]->core.position);
+        R_MapToScreen(app, map, position.x, position.y, &sx, &sy);
+        app->cam.x += (float)app->win.w * 0.5f - sx;
+        app->cam.y += (float)app->win.h * 0.5f - sy;
+        return true;
+    }
+    return false;
+}
+
+static void focus_camera_on_grid(app_t *app, const level_t *map,
+                                 float gx, float gy) {
+    if (!app || !map) return;
+    float sx = 0.0f, sy = 0.0f;
+    R_MapToScreen(app, map, gx, gy, &sx, &sy);
+    irect_t viewport = G_WorldViewport(app);
+    app->cam.x += (float)(viewport.x + viewport.w / 2) - sx;
+    app->cam.y += (float)(viewport.y + viewport.h / 2) - sy;
+}
+
+static bool focus_camera_on_map_start(app_t *app, const level_t *map) {
+    if (!app || !map || !map->has_camera) return false;
+    focus_camera_on_grid(app, map, map->camera.x, map->camera.y);
+    return true;
+}
+
+/* Packaged builds keep the default data tree beside the executable. */
+static const char *default_data_root(void) {
+    static char beside_executable[1024];
+    if (access(g_game_default_root, F_OK) == 0) return g_game_default_root;
+    char *base = SDL_GetBasePath();
+    if (!base) return g_game_default_root;
+    int written = snprintf(beside_executable, sizeof(beside_executable), "%s%s",
+                           base, g_game_default_root);
+    SDL_free(base);
+    if (written < 0 || (size_t)written >= sizeof(beside_executable))
+        return g_game_default_root;
+    if (access(beside_executable, F_OK) == 0) return beside_executable;
+    return g_game_default_root;
+}
+
+/* What a network resync needs to replace the running game under main()'s
+ * feet: the lists and caches built from the old objects are rebuilt. */
+static struct {
+    app_t *app;
+    AiContext *ai;
+    hudtext_t *hud;
+    mobjlist_t *objects;
+    mobj_t ***units;
+    int *unit_count;
+    spritecache_t *sprites;
+    const char *data_root;
+} resync;
+
+static bool resync_save(void **data, size_t *length) {
+    return G_ResyncSave(data, length, resync.app, resync.ai, resync.hud);
+}
+
+static bool resync_load(const void *data, size_t length) {
+    if (!G_ResyncLoad(data, length, resync.app, resync.ai, resync.hud)) return false;
+    P_FreeMobjList(resync.objects);
+    *resync.objects = P_ListMobjs();
+    *resync.units = resync.objects->items;
+    *resync.unit_count = resync.objects->count;
+    R_InitSprites(resync.data_root, &level, *resync.units, *resync.unit_count, resync.sprites);
+    return true;
+}
+
+static const netresync_t resync_handlers = { resync_save, resync_load };
+
+int main(int argc, char **argv) {
+#ifdef __ANDROID__
+    /* Retail paths are relative to data/, including paths in mission scripts. */
+    const char *directory = SDL_AndroidGetInternalStoragePath();
+    if (!directory || chdir(directory) != 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Cannot enter app data directory");
+        return 1;
+    }
+#endif
+#ifdef __ANDROID__
+    if (argc == 2 && !strcmp(argv[1], "--android-smoke")) {
+        renderer_t probe;
+        if (!renderer_create(&probe, sdl_renderer_backend(), "SDL probe", 640, 480, false, false))
+            return 1;
+        SDL_Log("OPEN_RTS_SMOKE_READY");
+        uint64_t until = SDL_GetTicks64() + 15000;
+        while (SDL_GetTicks64() < until) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                I_GraphicsEvent(&event);
+                if (event.type == SDL_QUIT) until = 0;
+                if (event.type == SDL_MOUSEBUTTONDOWN && event.button.which == SDL_TOUCH_MOUSEID)
+                    SDL_Log("OPEN_RTS_SMOKE_TOUCH");
+                if (event.type == SDL_APP_DIDENTERBACKGROUND) SDL_Log("OPEN_RTS_SMOKE_BACKGROUND");
+                if (event.type == SDL_APP_DIDENTERFOREGROUND) SDL_Log("OPEN_RTS_SMOKE_FOREGROUND");
+            }
+            renderer_begin_frame(&probe, (SDL_Color){11, 14, 16, 255});
+            renderer_end_frame(&probe);
+            SDL_Delay(16);
+        }
+        renderer_destroy(&probe);
+        SDL_Log("OPEN_RTS_SMOKE_OK");
+        return 0;
+    }
+#endif
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) goto help;
+    G_InitGame();
+    /* A game may default above retail speed; --speed still overrides it. */
+    if (gameinfo->game_speed) D_SetGameSpeed(gameinfo->game_speed);
+    D_LoadSettings();
+    if (!I_InitNetwork(&argc, argv)) {
+        fprintf(stderr, "%s\n", neterror);
+        return 1;
+    }
+    atexit(D_QuitNetGame);
+    consoleplayer = doomcom->consoleplayer;
+    bool check_only = false, screenshot_only = false;
+    const char *screenshot_path = NULL;
+    bool software_renderer = false;
+    int check_tics = 0, positional = 0;
+    isize2_t window = {0, 0};
+    const char *paths[3] = {NULL, NULL, NULL};
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (!strcmp(arg, "--check")) check_only = true;
+        else if (!strcmp(arg, "--software")) software_renderer = true;
+        else if (!strcmp(arg, "--nosound")) nosound = true;
+        else if (!strncmp(arg, "-map=", 5) || !strncmp(arg, "--map=", 6)) {
+            const char *value = strchr(arg, '=') + 1;
+            if (!*value || paths[1]) goto usage;
+            paths[1] = value;
+        }
+        else if (!strcmp(arg, "--map") || !strcmp(arg, "--data") || !strcmp(arg, "--sprite")) {
+            int slot = !strcmp(arg, "--data") ? 0 : !strcmp(arg, "--map") ? 1 : 2;
+            if (++i == argc || !argv[i][0] || paths[slot]) goto usage;
+            paths[slot] = argv[i];
+        } else if (!strncmp(arg, "-speed=", 7) || !strncmp(arg, "--speed=", 8)) {
+            const char *value = strchr(arg, '=') + 1;
+            char *end;
+            long speed = strtol(value, &end, 10);
+            if (!value[0] || *end || speed < 10 || speed > 200) goto usage;
+            D_SetGameSpeed((int)speed);
+        } else if (!strcmp(arg, "--speed") || !strcmp(arg, "-speed")) {
+            if (++i == argc) goto usage;
+            char *end;
+            long speed = strtol(argv[i], &end, 10);
+            if (!argv[i][0] || *end || speed < 10 || speed > 200) goto usage;
+            D_SetGameSpeed((int)speed);
+        } else if (!strcmp(arg, "--screenshot")) {
+            if (++i == argc || !argv[i][0]) goto usage;
+            screenshot_only = true; screenshot_path = argv[i];
+        } else if (!strcmp(arg, "--window")) {
+            if (++i == argc || sscanf(argv[i], "%dx%d", &window.w, &window.h) != 2 ||
+                window.w < 320 || window.h < 240 || window.w > 8192 || window.h > 8192) goto usage;
+        } else if (!strcmp(arg, "--net-check")) {
+            if (++i == argc) goto usage;
+            char *end;
+            long count = strtol(argv[i], &end, 10);
+            if (!argv[i][0] || *end || count < 1 || count > 1000000) goto usage;
+            check_tics = (int)count;
+        } else if (arg[0] == '-') goto usage;
+        else {
+            if (positional == 3 || paths[positional]) goto usage;
+            paths[positional++] = arg;
+        }
+    }
+    if ((check_only && screenshot_only) || (check_tics && (check_only || screenshot_only)) ||
+        (netgame && (check_only || screenshot_only)) || (I_NetJoining() && paths[1])) goto usage;
+    const char *data_root = paths[0] ? paths[0] : default_data_root();
+    const char *sprite_name = paths[2] ? paths[2] : g_game_default_sprite;
+    const char *map_arg = paths[1] ? paths[1] : g_game_default_map;
+    char map_name[1024], map_path[1024];
+    if (strlen(map_arg) >= sizeof(map_name)) goto usage;
+    strcpy(map_name, map_arg);
+
+    renderer_t renderer;
+    app_t app = { .win = { DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT } };
+    isize2_t window_size = window.w > 0 ? window : app.win;
+    app.show_grid = false;
+    app.running = true;
+    if (!renderer_create(&renderer, sdl_renderer_backend(), "open-rts - paletted RTS base",
+                             window_size.w, window_size.h,
+                             check_only || screenshot_only || check_tics,
+                             check_only || screenshot_only || check_tics || software_renderer)) {
+        return 1;
+    }
+    app.window = renderer.window;
+    app.renderer = renderer.sdl;
+    R_RefreshViewport(&app);
+
+    if (!check_only && !screenshot_only && !check_tics) S_Init(data_root);
+    if (!check_only && !check_tics) {
+        if (!M_Init(&app, data_root)) {
+            fprintf(stderr, "Could not initialize %s menu\n", g_game_name);
+            M_Shutdown();
+            S_Shutdown();
+            renderer_destroy(&renderer);
+            return 1;
+        }
+        /* Every game boots to its main menu unless a map was given. */
+        if (!paths[1] && !netgame) M_StartControlPanel(&app);
+    }
+    /* No level, thinkers, mission or sidebar exists while choosing New Game. */
+main_menu:
+    while (app.running && menuactive) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            I_GraphicsEvent(&event);
+            M_Responder(&app, &event, false);
+            if (event.type == SDL_WINDOWEVENT) R_RefreshViewport(&app);
+            if (!menuactive || !app.running) break;
+        }
+        if (!menuactive || !app.running) break;
+        M_Ticker();
+        S_UpdateSounds(&app, NULL);
+        renderer_begin_frame(&renderer, (SDL_Color){11, 14, 16, 255});
+        M_Drawer(&app);
+        if (screenshot_only) {
+            bool saved = renderer_save_screenshot(&renderer, screenshot_path);
+            M_Shutdown();
+            S_Shutdown();
+            renderer_destroy(&renderer);
+            return saved ? 0 : 1;
+        }
+        renderer_end_frame(&renderer);
+        SDL_Delay(1);
+    }
+    if (!app.running) {
+        M_Shutdown();
+        S_Shutdown();
+        renderer_destroy(&renderer);
+        return menuerror ? 1 : 0;
+    }
+load_level:
+    if (menumap) {
+        snprintf(map_name, sizeof(map_name), "%s", menumap);
+        menumap = NULL;
+    }
+
+    if (!I_StartNetGame(g_game_id, map_name, sizeof(map_name))) goto network_failure;
+    consoleplayer = doomcom->consoleplayer;
+    int path_length = map_name[0] == '/' ?
+        snprintf(map_path, sizeof(map_path), "%s", map_name) :
+        snprintf(map_path, sizeof(map_path), "%s/%s", data_root, map_name);
+    if (path_length < 0 || (size_t)path_length >= sizeof(map_path)) {
+        fprintf(stderr, "Map path is too long\n");
+        M_Shutdown();
+        S_Shutdown();
+        renderer_destroy(&renderer);
+        return 1;
+    }
+    P_InitThinkers();
+    if (!G_DoLoadLevel(map_path, &level) || !P_InitSight()) {
+        P_FreeLevel(&level);
+        M_Shutdown();
+        S_Shutdown();
+        renderer_destroy(&renderer);
+        return 1;
+    }
+
+    tileset_t tileset;
+    spritesheet_t unit_sprite;
+    memset(&tileset, 0, sizeof(tileset));
+    memset(&unit_sprite, 0, sizeof(unit_sprite));
+    if (!W_LoadAssets(data_root, &level, sprite_name, &tileset, &unit_sprite)) {
+        P_FreeLevel(&level);
+        M_Shutdown();
+        S_Shutdown();
+        renderer_destroy(&renderer);
+        return 1;
+    }
+    R_SetLevelPalette(&tileset);
+    app.cell.w = g_cell_w > 0 ? g_cell_w : (tileset.tile_w > 0 ? tileset.tile_w : CELL_W);
+    app.cell.h = g_cell_h > 0 ? g_cell_h : (tileset.tile_h > 0 ? tileset.tile_h : CELL_H);
+
+    P_LoadThings(map_path);
+    mobjlist_t objects = P_ListMobjs();
+    mobj_t **units = objects.items;
+    int unit_count = objects.count;
+    apply_actor_defaults(units, unit_count);
+    for (int i = 0; i < unit_count; ++i)
+        if (units[i]->owner != consoleplayer) P_MobjSetSelected(units[i], false);
+    P_UpdateSight();
+
+    /* The cache alone is over 1 MiB, larger than Android's SDL Java thread
+     * stack. Its lifetime is the active game, like the other level globals. */
+    static spritecache_t decoration_sprites;
+    memset(&decoration_sprites, 0, sizeof(decoration_sprites));
+    if (!R_InitSprites(data_root, &level, units, unit_count,
+                              &decoration_sprites)) {
+        fprintf(stderr, "warning: some %s runtime sprites were not loaded\n", g_game_name);
+    }
+
+    if (!(netgame && focus_camera_on_first_player_unit(&app, &level, units, unit_count)) &&
+        !focus_camera_on_map_start(&app, &level)) {
+        fvec2_t position = unit_count > 0 ? fixed3_xy_to_fvec2(units[0]->core.position) :
+            (fvec2_t){ (float)level.width * 0.5f, (float)level.height * 0.5f };
+        float focus_gx = position.x;
+        float focus_gy = position.y;
+        focus_camera_on_grid(&app, &level, focus_gx, focus_gy);
+    }
+    R_ClampCamera(&app, &level, G_WorldViewportWidth(&app), app.win.h);
+    S_Start(&level, data_root);
+
+    printf("Loaded %s (%dx%d, tileset %s, %d units, %d level decorations, %d resource vents). Controls: %s, Alt+left spawn enemy, WASD/arrows pan, G grid, B blocked overlay, Ctrl+A select all, %s.\n",
+           map_path, level.width, level.height, level.tileset_name, unit_count,
+           level.decoration_count, level.resource_vent_count,
+           R_Policy()->input == INPUT_RIGHT_CLICK_ORDERS ? "left select/drag, right order" : "left select/drag/order, right deselect",
+           (R_Policy()->f10 == F10_CONTROL_MENU) ? "F10 menu" : "F10 +100 resources");
+
+    menu_t *hud = G_InitHUD(&app, data_root);
+    AiContext ai;
+    P_AiInit(&ai);
+    P_AiAttachGame(&ai, G_AiInterface());
+    hudtext_t hud_text = { 0 };
+    if (g_loadfile[0]) {
+        if (!G_GameLoad(g_loadfile, &app, &ai, &hud_text)) {
+            HU_PushMessage(&hud_text, "Could not restore saved game", 5000);
+        }
+        g_loadfile[0] = '\0';
+        P_FreeMobjList(&objects);
+        objects = P_ListMobjs(); units = objects.items; unit_count = objects.count;
+        R_InitSprites(data_root, &level, units, unit_count, &decoration_sprites);
+    }
+    resync.app = &app; resync.ai = &ai; resync.hud = &hud_text;
+    resync.objects = &objects; resync.units = &units; resync.unit_count = &unit_count;
+    resync.sprites = &decoration_sprites; resync.data_root = data_root;
+    D_SetNetResync(&resync_handlers);
+    if (check_only || screenshot_only) {
+        if (screenshot_only) {
+            app.ticks_ms = SDL_GetTicks();
+            if (level.mission) {
+                int before_count = unit_count;
+                G_MissionTicker(&level, units, &unit_count,
+                                &hud_text, RTS_TICK_MS);
+                {
+                    fvec2_t camera_cell;
+                    if (G_TakeCameraRequest(&camera_cell)) {
+                        focus_camera_on_grid(&app, &level, camera_cell.x, camera_cell.y);
+                        R_ClampCamera(&app, &level, G_WorldViewportWidth(&app), app.win.h);
+                    }
+                }
+                P_FreeMobjList(&objects);
+                objects = P_ListMobjs();
+                units = objects.items;
+                unit_count = objects.count;
+                if (unit_count != before_count && !level.has_camera)
+                    focus_camera_on_first_player_unit(&app, &level, units, unit_count);
+                R_ClampCamera(&app, &level, G_WorldViewportWidth(&app), app.win.h);
+            }
+            /* The HUD shows the first of the player's units selected, a
+             * mobile one when there is one. */
+            {
+                mobj_t *shown = NULL;
+                for (int i = 0; i < unit_count && !(shown && shown->info && shown->info->speed > 0); ++i) {
+                    mobj_t *mo = units[i];
+                    if (mo->owner != consoleplayer || mo->remove || mo->hp <= 0) continue;
+                    if (!shown || (mo->info && mo->info->speed > 0)) shown = mo;
+                }
+                if (shown) P_MobjSetSelected(shown, true);
+            }
+            P_UpdateSight();
+            renderer_begin_frame(&renderer, (SDL_Color){ 11, 14, 16, 255 });
+            R_DrawLevel(&app, &level, &tileset);
+            R_RenderPlayerView(&app, &level, &tileset, units,
+                                 unit_count, &unit_sprite,
+                                 &decoration_sprites, gameinfo, SDL_GetTicks());
+
+            R_DrawGridOverlay(&app, &level);
+            if (gameinfo->draw_fog)
+                gameinfo->draw_fog(&app, &level, &tileset);
+            else
+                R_DrawFogTiles(&app, &level, &tileset);
+            hudview = (hudview_t){units, unit_count, &decoration_sprites, &hud_text, &tileset};
+            if (hud) M_MenuDrawer(hud);
+            if (renderer_save_screenshot(&renderer, screenshot_path)) {
+                printf("Saved screenshot %s.\n", screenshot_path);
+            }
+        }
+        printf("Smoke check OK: %d terrain tiles, %d unit frames from %s, %d resource vents.\n",
+               tileset.count, unit_sprite.numlumps, sprite_name, level.resource_vent_count);
+        G_ShutdownHUD();
+        R_FreeSpriteCache(&decoration_sprites);
+        R_FreeSprite(&unit_sprite);
+        R_FreeTileset(&tileset);
+        P_FreeMobjList(&objects);
+        P_FreeLevel(&level);
+        M_Shutdown();
+        S_Shutdown();
+        renderer_destroy(&renderer);
+        return 0;
+    }
+
+    uint64_t prev = SDL_GetPerformanceCounter();
+    double freq = (double)SDL_GetPerformanceFrequency();
+    int title_resources = -1;
+    uint32_t signature;
+    if (!G_NetSignature(map_path, &signature)) {
+        fprintf(stderr, "Could not fingerprint map %s\n", map_path);
+        snprintf(neterror, sizeof(neterror), "Map fingerprint failed");
+    } else {
+        D_CheckNetGame(signature);
+        if (netgame) {
+            for (int player = 0; player < doomcom->numplayers; ++player) {
+                bool has_units = false;
+                for (int i = 0; i < unit_count; ++i)
+                    if (units[i]->owner == player && units[i]->hp > 0 &&
+                        !units[i]->remove && (units[i]->traits & MF_SELECTABLE)) has_units = true;
+                if (has_units) continue;
+                snprintf(neterror, sizeof(neterror),
+                         "Map has no starting units for player %d; choose a multiplayer map with --map", player + 1);
+                break;
+            }
+        }
+    }
+    uint64_t check_started = SDL_GetTicks64();
+
+    while (app.running && !neterror[0]) {
+        uint64_t now = SDL_GetPerformanceCounter();
+        float frame_dt = (float)((double)(now - prev) / freq);
+        if (frame_dt > 0.25f) frame_dt = 0.25f;
+        prev = now;
+
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            I_GraphicsEvent(&e);
+            hudview = (hudview_t){units, unit_count, &decoration_sprites, &hud_text, &tileset};
+            if (D_MenuResponder(&app, &e, hud)) {
+                if (menumap || menuleave || !app.running) break;
+                continue;
+            }
+            if (e.type == SDL_KEYDOWN && !e.key.repeat &&
+                e.key.keysym.sym == SDLK_F10) {
+                if (R_Policy()->f10 == F10_CONTROL_MENU) {
+                    M_StartControlPanel(&app);
+                    continue;
+                }
+                if (netgame) continue;
+                level.player_resources[consoleplayer][0] += 100;
+                HU_PushMessage(&hud_text, "CHEAT: +100 RESOURCES", 2000);
+                continue;
+            }
+            if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT &&
+                (SDL_GetModState() & KMOD_ALT) != 0) {
+                if (netgame) continue;
+                if (spawn_debug_enemy_unit(&level, &app, e.button.x, e.button.y)) {
+                    P_FreeMobjList(&objects);
+                    objects = P_ListMobjs();
+                    units = objects.items;
+                    unit_count = objects.count;
+                    if (!R_InitSprites(data_root, &level,
+                                             units, unit_count,
+                                             &decoration_sprites)) {
+                        fprintf(stderr, "warning: failed to load debug enemy sprite\n");
+                    }
+                }
+                continue;
+            }
+            /* Cancellation applies over the HUD too, before its responders
+             * consume mouse buttons. Future games can retain right orders. */
+            if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_RIGHT &&
+                !(R_Policy()->input == INPUT_RIGHT_CLICK_ORDERS)) {
+                if (hud && M_MenuResponder(hud, &app, &e)) continue;
+                G_Responder(&app, &level, units, unit_count, &unit_sprite,
+                             &decoration_sprites, gameinfo, &e);
+                continue;
+            }
+            if (hud && M_MenuResponder(hud, &app, &e)) {
+                if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
+                    app.dragging_select = false;
+                    app.selection_rect = (irect_t){0};
+                }
+                continue;
+            }
+            G_Responder(&app, &level, units, unit_count, &unit_sprite,
+                         &decoration_sprites, gameinfo, &e);
+        }
+        if (menumap || menuleave || !app.running) break;
+        if (g_savefile[0]) {
+            bool saved = G_GameSave(g_savefile, g_savename, &app, &ai, &hud_text);
+            HU_PushMessage(&hud_text, saved ? "Game saved" : "Could not save game", 5000);
+            g_savefile[0] = '\0';
+        }
+        if (!menuactive) G_CameraMove(&app, frame_dt);
+        M_Ticker();
+        R_ClampCamera(&app, &level, G_WorldViewportWidth(&app), app.win.h);
+        /* A menu lobby belongs to the next level, not the paused old world. */
+        int runtics = I_NetMenuSession() ? 0 : TryRunTics();
+        if (check_tics && runtics > check_tics - gametic) runtics = check_tics - gametic;
+        while (runtics-- > 0) {
+            if (!D_RunTiccmds()) break;
+            /* Like Doom, menu pause stops the world, not the tic clock.
+             * Multiplayer continues so opening a menu cannot stall peers. */
+            if (paused || (menuactive && !netgame)) {
+                ++gametic;
+                NetUpdate();
+                continue;
+            }
+            P_Ticker();
+            P_FreeMobjList(&objects);
+            objects = P_ListMobjs();
+            units = objects.items;
+            unit_count = objects.count;
+            if (level.mission) {
+                int before_count = unit_count;
+                G_MissionTicker(&level, units, &unit_count,
+                                &hud_text, RTS_TICK_MS);
+                {
+                    fvec2_t camera_cell;
+                    if (G_TakeCameraRequest(&camera_cell)) {
+                        focus_camera_on_grid(&app, &level, camera_cell.x, camera_cell.y);
+                        R_ClampCamera(&app, &level, G_WorldViewportWidth(&app), app.win.h);
+                    }
+                }
+                P_FreeMobjList(&objects);
+                objects = P_ListMobjs();
+                units = objects.items;
+                unit_count = objects.count;
+                if (unit_count != before_count) {
+                    if (!level.has_camera) focus_camera_on_first_player_unit(&app, &level, units, unit_count);
+                    R_ClampCamera(&app, &level, G_WorldViewportWidth(&app), app.win.h);
+                    if (!R_InitSprites(data_root, &level,
+                                             units, unit_count,
+                                             &decoration_sprites)) {
+                        fprintf(stderr, "warning: failed to load scripted runtime sprites\n");
+                    }
+                }
+            }
+            /* After the mission, before production, as rts_game_model_tick orders it. */
+            G_OutcomeTicker(units, unit_count);
+            int before_production_count = unit_count;
+            bool production_spawned;
+            /* Every game's computer players buy through the universal AI. */
+            P_AiTick(&ai, &level, units, unit_count, gameinfo, RTS_TICK_MS);
+            production_spawned = G_UpdateProduction(&level, units, &unit_count, RTS_TICK_MS);
+            P_FreeMobjList(&objects);
+            objects = P_ListMobjs();
+            units = objects.items;
+            unit_count = objects.count;
+            if (production_spawned || unit_count != before_production_count) {
+                if (!R_InitSprites(data_root, &level,
+                                         units, unit_count,
+                                         &decoration_sprites)) {
+                    fprintf(stderr, "warning: failed to load produced unit sprite\n");
+                }
+            }
+            HU_Ticker(&hud_text, RTS_TICK_MS);
+            HU_Ticker(&chat_text, RTS_TICK_MS / 1000.0f);
+            if (hud) {
+                hudview = (hudview_t){units, unit_count, &decoration_sprites, &hud_text, &tileset};
+                if (hud->ticker) hud->ticker(hud);
+                else M_MenuTicker(hud);
+            }
+            ++gametic;
+            NetUpdate();
+        }
+        if (neterror[0]) break;
+        if (check_tics && gametic == check_tics) {
+            printf("Network check: player=%d gametic=%d consistency=%08x\n",
+                   consoleplayer + 1, gametic, G_Consistency());
+            app.running = false;
+        }
+        if (check_tics && SDL_GetTicks64() - check_started > (uint64_t)check_tics * 1000 / RTS_TICRATE + 30000) {
+            snprintf(neterror, sizeof(neterror), "Network check timed out at tic %d", gametic);
+            fprintf(stderr, "%s\n", neterror);
+            app.running = false;
+        }
+        if (check_tics) { SDL_Delay(1); continue; }
+        if (level.player_resources[consoleplayer][0] != title_resources) {
+            char title[128];
+            title_resources = level.player_resources[consoleplayer][0];
+            snprintf(title, sizeof(title), "open-rts - %s - Resources %d", g_game_name, title_resources);
+            SDL_SetWindowTitle(app.window, title);
+        }
+
+        app.ticks_ms = SDL_GetTicks();
+        S_UpdateSounds(&app, &level);
+        renderer_begin_frame(&renderer, (SDL_Color){ 11, 14, 16, 255 });
+        R_DrawLevel(&app, &level, &tileset);
+        R_RenderPlayerView(&app, &level, &tileset, units, unit_count, &unit_sprite,
+                             &decoration_sprites, gameinfo, SDL_GetTicks());
+
+        R_DrawGridOverlay(&app, &level);
+        if (gameinfo->draw_fog)
+            gameinfo->draw_fog(&app, &level, &tileset);
+        else
+            R_DrawFogTiles(&app, &level, &tileset);
+        if (app.dragging_select)
+            V_DrawRectOutline(app.selection_rect, V_NearestIndex(0xff62e0a1u));
+        hudview = (hudview_t){units, unit_count, &decoration_sprites, &hud_text, &tileset};
+        if (hud) M_MenuDrawer(hud);
+        M_Drawer(&app);
+        renderer_end_frame(&renderer);
+    }
+
+    /* Let bounded-check clients consume the final commands and quit before
+     * shutting down their relay. No further simulation tics run here. */
+    if (check_tics && gametic == check_tics && netgame && !consoleplayer && !I_NetJoining()) {
+        uint64_t until = SDL_GetTicks64() + 2000;
+        bool waiting = true;
+        while (waiting && !neterror[0] && SDL_GetTicks64() < until) {
+            NetUpdate();
+            waiting = false;
+            for (int p = 1; p < doomcom->numplayers; ++p) waiting |= playeringame[p];
+            SDL_Delay(1);
+        }
+    }
+    int exit_code = neterror[0] || menuerror ? 1 : 0;
+    if (!neterror[0]) {
+        if (!menumap && I_NetMenuSession()) I_CancelNetGame();
+        if (!(menumap && I_NetMenuSession())) D_QuitNetGame();
+    }
+    G_ShutdownHUD();
+    R_FreeSpriteCache(&decoration_sprites);
+    R_FreeSprite(&unit_sprite);
+    R_FreeTileset(&tileset);
+    P_FreeMobjList(&objects);
+    P_FreeLevel(&level);
+    if (neterror[0]) goto network_failure;
+    if (app.running && menumap && !exit_code) goto load_level;
+    if (app.running && menuleave && !exit_code) {
+        menuleave = false;
+        M_StartControlPanel(&app);
+        goto main_menu;
+    }
+    M_Shutdown();
+    S_Shutdown();
+    renderer_destroy(&renderer);
+    return exit_code;
+network_failure:
+    fprintf(stderr, "%s\n", neterror);
+    if (check_tics || !app.running || menuerror) {
+        D_QuitNetGame();
+        M_Shutdown();
+        S_Shutdown();
+        renderer_destroy(&renderer);
+        return 1;
+    }
+    D_NetGameError(&app);
+    goto main_menu;
+usage:
+    fprintf(stderr, "Invalid arguments. Use --help for command-line options.\n");
+    return 1;
+help:
+    printf("Usage: %s [options] [data-root [map [sprite]]]\n"
+           "  --host                 Host a game (you are player 1)\n"
+           "  --players <2..%d>       Players to wait for; default 2\n"
+           "  --join <host[:port]>   Join; receive the host's map and player slot\n"
+           "  --port <1..65535>      Local UDP port; host 5029, client automatic\n"
+           "  --map <path>           Map relative to data root; chosen by host\n"
+           "  -map=<path>           Start directly in a map (also --map=<path>)\n"
+           "  --speed <10..200>     Simulation speed percent; default 100; joiners use host speed\n"
+           "  Dark Colony opens its main menu when no map is supplied.\n"
+           "  --check and --net-check use the default map; screenshots show startup.\n"
+           "  --data <directory>     Game data directory (default %s, or that path beside the executable)\n"
+           "  --sprite <path>        Default sprite asset\n"
+           "  --software            Use the software renderer\n"
+           "  --nosound             Disable sound effects\n"
+           "  --window <WxH>         Initial window size (default "
+#ifdef RTS_NATIVE_WORLD
+           "1280x960"
+#else
+           "640x480"
+#endif
+           ")\n"
+           "  --check | --screenshot <file.bmp>   Offline smoke check\n"
+           "  --net-check <tics>     Run a bounded headless simulation\n"
+           "  --net <1..%d> <peers...>  Legacy manual peer setup\n"
+           "  --dup <1..9> --extratic  Doom command timing/redundancy\n",
+           argv[0], MAXPLAYERS, g_game_default_root, MAXPLAYERS);
+    return 0;
+}

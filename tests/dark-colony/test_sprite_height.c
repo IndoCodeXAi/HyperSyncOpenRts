@@ -1,0 +1,63 @@
+#include "engine.h"
+#include "info.h"
+#include <assert.h>
+#include <stdio.h>
+
+int main(void) {
+    V_AllocScreen(2, 128);
+    assert(screens[0].pixels);
+    app_t app = { .win = {2, 128}, .cell = {32, 32}, .cam = {0, 110} };
+    level_t map = {0};
+    spritesheet_t sheet = {0};
+    assert(R_AllocSpriteCells(&sheet, 1));
+    sheet.cells[0].rect = (irect_t){0, 0, 2, 64};
+    sheet.lumps[0].indices = malloc(128);
+    sheet.palette_maps = calloc(1, sizeof(*sheet.palette_maps));
+    assert(sheet.lumps[0].indices && sheet.palette_maps);
+    memset(sheet.lumps[0].indices, 1, 128);
+    sheet.source_palette[0] = 0xff000000;
+    sheet.source_palette[1] = 0xffff0000;
+    sheet.source_palette[2] = 0xff00ff00;
+    I_SetPalette(sheet.source_palette);
+    sheet.palette_map_count = 1;
+    sheet.palette_maps[0].id = 1;
+    sheet.palette_maps[0].indices[1] = 2;
+    /* Two frames share indexed pixels; the elevated object belongs to green. */
+    assert(R_InitSpriteDef(&sheet, 2, 1));
+    assert(R_InstallSpriteLump(&sheet, 0, 0, 0, false));
+    assert(R_InstallSpriteLump(&sheet, 1, 0, 0, false));
+    sheet.spritedef.spriteframes[1].directions[0].layers[0].remap = 4;
+    state_t states[3] = {{0}, {.tics = -1}, {.frame = 1, .tics = -1}};
+    gameinfo_t game = {.states = states, .state_count = 3,
+                      .state_coord_mode = RTS_STATE_COORDS_FIN_TOP_LEFT};
+    gameinfo = &game;
+    mobj_t ground = {.traits = MF_RENDERABLE};
+    mobj_t ship = {.traits = MF_RENDERABLE, .team = 1};
+    assert(P_SetMobjState(&ground, 1) && P_SetMobjState(&ship, 2));
+    ship.core.position = fixed3_from_fixed2(FIXED2_LIT(0, 0), 50 * FIXED_ONE / g_cell_h);
+    float sx, sy, ground_sx, ground_sy;
+    R_MapPositionToScreen(&app, &map, ship.core.position, &sx, &sy);
+    R_MapPositionToScreen(&app, &map, ground.core.position, &ground_sx, &ground_sy);
+    assert(sx == ground_sx && ground_sy - sy == 50);
+    app.cell = (isize2_t){64, 64};
+    R_MapPositionToScreen(&app, &map, ship.core.position, &sx, &sy);
+    assert(ground_sy - sy == 100);
+    app.cell = (isize2_t){32, 32};
+    /* Both ground-Y orders and both input orders must leave the ship on top. */
+    for (int y = -1; y <= 1; y += 2) {
+        ground.core.position = fixed3_from_fixed2(FIXED2_LIT(0, y * 0.125f), 0);
+        for (int reverse = 0; reverse < 2; ++reverse) {
+            mobj_t *units[2] = {reverse ? &ship : &ground, reverse ? &ground : &ship};
+            V_BeginFrame(0xff000000u);
+            R_RenderPlayerView(&app, &map, NULL, units, 2, &sheet, NULL, &game, 0);
+            uint32_t pixels[256];
+            V_ReadPixels(pixels, 2 * sizeof(*pixels));
+            assert(pixels[55 * 2] == 0xff00ff00);
+            assert(pixels[90 * 2] == 0xffff0000);
+        }
+    }
+    R_FreeSprite(&sheet);
+    V_FreeScreen();
+    puts("PASS: Z raises sprites with scale and sorts them above ground objects");
+    return 0;
+}

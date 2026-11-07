@@ -1,0 +1,3343 @@
+#ifndef __ENGINE__
+#define __ENGINE__
+
+#include <SDL.h>
+#include "fixed.h"
+#include <limits.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include "game_config.h" /* per-game build shape: RTS_MODULE_*, level fields */
+
+
+typedef struct { int x, y; }   ivec2_t;
+typedef struct { float x, y; } fvec2_t;
+
+enum { NAV_MAX_WAYPOINTS = 64 };
+
+/* Waypoints in world cells, produced by P_NavPlan and owned by one mobj. */
+typedef struct {
+    fixed2_t points[NAV_MAX_WAYPOINTS];
+    int count, current;
+    fixed2_t goal;  /* Resolved goal: the request, or the nearest reachable spot. */
+    bool complete; /* The last point is the goal; otherwise replan when consumed. */
+} navpath_t;
+typedef struct { int w, h; }   isize2_t;
+
+typedef int32_t fixed_t;
+typedef struct { fixed_t x, y, z; } fixed3_t;
+
+enum {
+    FIXED_FRAC_BITS = 16,
+    FIXED_ONE = 1 << FIXED_FRAC_BITS,
+};
+
+/* Engine-facing rectangle names with exact SDL ABI compatibility. */
+typedef SDL_Rect  irect_t;
+typedef SDL_FRect frect_t;
+
+static inline isize2_t isize2_max(isize2_t a, isize2_t b) {
+    return (isize2_t){ a.w > b.w ? a.w : b.w, a.h > b.h ? a.h : b.h };
+}
+
+/* fvec2_t is presentation only (camera, sprites, audio). Simulation positions
+ * are fixed2_t (16.16, fixed.h). */
+static inline fvec2_t fvec2_add(fvec2_t a, fvec2_t b) { return (fvec2_t){ a.x + b.x, a.y + b.y }; }
+static inline fvec2_t fvec2_sub(fvec2_t a, fvec2_t b) { return (fvec2_t){ a.x - b.x, a.y - b.y }; }
+static inline fvec2_t fvec2_scale(fvec2_t value, float scale) {
+    return (fvec2_t){ value.x * scale, value.y * scale };
+}
+static inline float fvec2_length_squared(fvec2_t value) {
+    return value.x * value.x + value.y * value.y;
+}
+static inline float fvec2_distance_squared(fvec2_t a, fvec2_t b) {
+    return fvec2_length_squared(fvec2_sub(a, b));
+}
+static inline fvec2_t fvec2_cell_center(ivec2_t cell) {
+    return (fvec2_t){ (float)cell.x + 0.5f, (float)cell.y + 0.5f };
+}
+static inline ivec2_t fvec2_cell(fvec2_t value) {
+    return (ivec2_t){ (int)floorf(value.x), (int)floorf(value.y) };
+}
+static inline ivec2_t ivec2_add(ivec2_t a, ivec2_t b) {
+    return (ivec2_t){ a.x + b.x, a.y + b.y };
+}
+
+static inline ivec2_t ivec2_sub(ivec2_t a, ivec2_t b) {
+    return (ivec2_t){ a.x - b.x, a.y - b.y };
+}
+
+static inline int64_t ivec2_distance_squared64(ivec2_t a, ivec2_t b) {
+    ivec2_t d = ivec2_sub(a, b);
+    return (int64_t)d.x * d.x + (int64_t)d.y * d.y;
+}
+
+static inline ivec2_t ivec2_scale(ivec2_t v, int scale) {
+    return (ivec2_t){ v.x * scale, v.y * scale };
+}
+
+static inline bool ivec2_equal(ivec2_t a, ivec2_t b) {
+    return a.x == b.x && a.y == b.y;
+}
+
+static inline fixed_t fixed_from_float(float value) {
+    double scaled = (double)value * (double)FIXED_ONE;
+    if (isnan(scaled)) return 0;
+    if (scaled >= (double)INT32_MAX) return INT32_MAX;
+    if (scaled <= (double)INT32_MIN) return INT32_MIN;
+    return (fixed_t)llround(scaled);
+}
+
+static inline float fixed_to_float(fixed_t value) {
+    return (float)value / (float)FIXED_ONE;
+}
+
+static inline fixed_t fixed_add_saturated(fixed_t a, fixed_t b) {
+    int64_t sum = (int64_t)a + (int64_t)b;
+    if (sum > INT32_MAX) return INT32_MAX;
+    if (sum < INT32_MIN) return INT32_MIN;
+    return (fixed_t)sum;
+}
+
+static inline fixed_t fixed_sub_saturated(fixed_t a, fixed_t b) {
+    int64_t difference = (int64_t)a - (int64_t)b;
+    if (difference > INT32_MAX) return INT32_MAX;
+    if (difference < INT32_MIN) return INT32_MIN;
+    return (fixed_t)difference;
+}
+
+/* Whole cell to 16.16 and back (floor). */
+#define FIXED_FROM_INT(n) ((fixed_t)((int32_t)(n) * FIXED_ONE))
+static inline int fixed_floor_int(fixed_t v) { return (int)(v >> FIXED_FRAC_BITS); }
+static inline int fixed_ceil_int(fixed_t v) { return (int)((v + (FIXED_ONE - 1)) >> FIXED_FRAC_BITS); }
+static inline fixed_t fixed_abs(fixed_t v) { return v < 0 ? -v : v; }
+static inline fixed_t fixed_min(fixed_t a, fixed_t b) { return a < b ? a : b; }
+static inline fixed_t fixed_max(fixed_t a, fixed_t b) { return a > b ? a : b; }
+/* Square of a 16.16 value, 32.32. */
+static inline int64_t fixed_sq64(fixed_t v) { return (int64_t)v * v; }
+
+static inline fixed2_t fixed2_cell_center(ivec2_t cell) {
+    return (fixed2_t){ FIXED_FROM_INT(cell.x) + FIXED_ONE / 2, FIXED_FROM_INT(cell.y) + FIXED_ONE / 2 };
+}
+static inline fixed2_t fixed2_from_cell(ivec2_t cell) {
+    return (fixed2_t){ FIXED_FROM_INT(cell.x), FIXED_FROM_INT(cell.y) };
+}
+static inline ivec2_t fixed2_cell(fixed2_t v) {
+    return (ivec2_t){ fixed_floor_int(v.x), fixed_floor_int(v.y) };
+}
+/* Top-left cell of a w x h footprint centred on `centre` (the 0.001 absorbs
+ * 16.16 rounding of authored half-cell centres). */
+static inline ivec2_t fixed2_footprint_corner(fixed2_t centre, isize2_t foot) {
+    return (ivec2_t){ fixed_floor_int(centre.x - foot.w * (FIXED_ONE / 2) + FIXED_LIT(0.001)),
+                      fixed_floor_int(centre.y - foot.h * (FIXED_ONE / 2) + FIXED_LIT(0.001)) };
+}
+/* Cell holding the top-left corner of a footprint centred on `centre`. */
+static inline ivec2_t fixed2_foot_origin_cell(fixed2_t centre, isize2_t foot) {
+    return fixed2_cell((fixed2_t){ centre.x - foot.w * (FIXED_ONE / 2), centre.y - foot.h * (FIXED_ONE / 2) });
+}
+static inline int64_t fixed2_distance_squared64(fixed2_t a, fixed2_t b) { /* 32.32 */
+    return fixed2_length_squared64(fixed2_sub(a, b));
+}
+/* True when both axes differ by less than epsilon (16.16). */
+static inline bool fixed2_near(fixed2_t a, fixed2_t b, fixed_t epsilon) {
+    fixed2_t d = fixed2_sub(a, b);
+    return d.x > -epsilon && d.x < epsilon && d.y > -epsilon && d.y < epsilon;
+}
+static inline bool fixed2_equal(fixed2_t a, fixed2_t b) { return a.x == b.x && a.y == b.y; }
+/* Presentation boundary: simulation fixed -> screen/audio float. */
+static inline fvec2_t fvec2_from_fixed2(fixed2_t v) {
+    return (fvec2_t){ (float)v.x / (float)FIXED_ONE, (float)v.y / (float)FIXED_ONE };
+}
+/* Input boundary: UI-computed float position -> simulation fixed. Only the
+ * UI/command-issue side may call this; the simulation never does. */
+static inline fixed2_t fixed2_from_fvec2(fvec2_t v) {
+    return (fixed2_t){ fixed_from_float(v.x), fixed_from_float(v.y) };
+}
+
+static inline fixed3_t fixed3_from_fixed2(fixed2_t value, fixed_t z) {
+    return (fixed3_t){ value.x, value.y, z };
+}
+static inline fixed2_t fixed3_xy(fixed3_t value) { return (fixed2_t){ value.x, value.y }; }
+static inline fvec2_t fixed3_xy_to_fvec2(fixed3_t value) {
+    return (fvec2_t){ fixed_to_float(value.x), fixed_to_float(value.y) };
+}
+
+static inline fixed3_t fixed3_add(fixed3_t a, fixed3_t b) {
+    return (fixed3_t){
+        fixed_add_saturated(a.x, b.x),
+        fixed_add_saturated(a.y, b.y),
+        fixed_add_saturated(a.z, b.z),
+    };
+}
+
+static inline fixed3_t fixed3_zero(void) {
+    return (fixed3_t){ 0, 0, 0 };
+}
+
+static inline fixed3_t fixed3_sub(fixed3_t a, fixed3_t b) {
+    return (fixed3_t){a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+static inline fixed3_t fixed3_planar_delta(fixed2_t delta) {
+    return fixed3_from_fixed2(delta, 0);
+}
+
+static inline fixed3_t fixed3_add_planar(fixed3_t position,
+                                                fixed3_t displacement) {
+    return (fixed3_t){
+        fixed_add_saturated(position.x, displacement.x),
+        fixed_add_saturated(position.y, displacement.y),
+        position.z,
+    };
+}
+
+static inline fixed3_t fixed3_with_xy(fixed3_t value, fixed2_t xy) {
+    return (fixed3_t){ xy.x, xy.y, value.z };
+}
+
+static inline fixed3_t fixed3_planar_displacement(fixed3_t from,
+                                                         fixed3_t to) {
+    return (fixed3_t){
+        fixed_sub_saturated(to.x, from.x),
+        fixed_sub_saturated(to.y, from.y),
+        0,
+    };
+}
+
+static inline irect_t irect_from_points(ivec2_t a, ivec2_t b) {
+    return (irect_t){
+        a.x < b.x ? a.x : b.x,
+        a.y < b.y ? a.y : b.y,
+        a.x < b.x ? b.x - a.x : a.x - b.x,
+        a.y < b.y ? b.y - a.y : a.y - b.y,
+    };
+}
+
+static inline bool irect_contains(irect_t rect, ivec2_t point) {
+    return point.x >= rect.x && point.y >= rect.y &&
+           point.x < rect.x + rect.w && point.y < rect.y + rect.h;
+}
+
+static inline bool irect_intersects(irect_t a, irect_t b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x &&
+           a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+static inline frect_t frect_from_points(fvec2_t a, fvec2_t b) {
+    return (frect_t){
+        a.x < b.x ? a.x : b.x,
+        a.y < b.y ? a.y : b.y,
+        a.x < b.x ? b.x - a.x : a.x - b.x,
+        a.y < b.y ? b.y - a.y : a.y - b.y,
+    };
+}
+
+static inline bool frect_contains(frect_t rect, fvec2_t point) {
+    return point.x >= rect.x && point.y >= rect.y &&
+           point.x < rect.x + rect.w && point.y < rect.y + rect.h;
+}
+
+static inline bool frect_intersects(frect_t a, frect_t b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x &&
+           a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+
+typedef struct app_s {
+    SDL_Window *window;
+    SDL_Renderer *renderer; /* Present only. Drawing goes through screens[0]. */
+    isize2_t win; /* Framebuffer size; native-world builds follow the OS window. */
+    isize2_t cell;
+    fvec2_t  cam;
+    bool show_grid;
+    bool show_blocked;
+    bool running;
+    bool dragging_select;
+    bool panning;
+    ivec2_t  mouse_down;
+    ivec2_t  mouse;
+    uint32_t ticks_ms;
+    irect_t selection_rect;
+} app_t;
+
+
+typedef struct blob_s {
+    uint8_t *bytes; /* W_ReadFile appends a NUL byte outside size. */
+    size_t size;
+} blob_t;
+
+
+#define CELL_W 24
+#define CELL_H 24
+#define TILE_PIX_W 24
+#define TILE_PIX_H 24
+#define TILE_ATLAS_COLS 24
+#define MAX_DECORATIONS 8192
+#define MAX_DECORATION_SPRITES 512
+#define MAX_TILE_OVERLAYS 3
+#define MAX_TILE_ANIMATION_FRAMES 8
+#define MAX_SPRITE_ROTATIONS 32
+#define MAX_PATH_CELLS 4096
+#define RTS_TICRATE 30
+#define RTS_MAX_UPGRADE_TYPES 106
+#define WORLD_CLOCK_MS 66 /* DC.EXE's default environment clock. */
+#define RTS_TICK_MS 33 /* One simulation tic in milliseconds (1000 / RTS_TICRATE, truncated). */
+/* Distance covered in one tic by a speed given in cells per second (16.16). */
+#define FIXED_STEP_PER_TIC(speed) ((fixed_t)(((speed) + RTS_TICRATE / 2) / RTS_TICRATE))
+
+#ifndef RTS_WORLD_Y_UP
+#define RTS_WORLD_Y_UP 0
+#endif
+
+#if RTS_WORLD_Y_UP != 0 && RTS_WORLD_Y_UP != 1
+#error "RTS_WORLD_Y_UP must be 0 or 1"
+#endif
+
+#define RTS_SPRITEFRAME_FLIP_X (1u << 0) /* Doom-style spriteframe_t.flip[rotation]. */
+#define RTS_FRAME_FLIP_X RTS_SPRITEFRAME_FLIP_X
+#define RTS_FRAME_BLINK (1u << 3)
+
+
+/* Hexen/Doom binary angle measurement: east=0, north=ANG90, increasing CCW. */
+typedef uint32_t angle_t;
+
+#define ANG45  UINT32_C(0x20000000)
+#define ANG90  UINT32_C(0x40000000)
+#define ANG180 UINT32_C(0x80000000)
+#define ANG270 UINT32_C(0xc0000000)
+#define ANGLE_MAX UINT32_MAX
+
+/* Movement vectors use screen coordinates: +x=east, +y=south. */
+angle_t angle_from_screen_vector_fixed(fixed_t dx, fixed_t dy);
+void angle_to_screen_vector_fixed(angle_t angle, fixed_t *dx, fixed_t *dy);
+uint32_t angle_distance(angle_t a, angle_t b);
+
+/* Quantize a BAM angle into an authored rotation table.  first_angle is the
+ * direction represented by slot zero; count may be up to 32. */
+int angle_to_direction(angle_t angle, int count, angle_t first_angle, bool clockwise);
+angle_t direction_to_angle(int direction, int count, angle_t first_angle, bool clockwise);
+
+
+typedef struct app_s app_t;
+typedef struct tileset_s tileset_t;
+typedef struct menu_s menu_t;
+typedef struct menuitem_s menuitem_t;
+struct nav_s;
+
+typedef ivec2_t cell_t;
+
+/* Native DC terrain flag positions, shared by the engine sight traversal. */
+enum {
+    MAP_SIGHT_PASS = 1u << 7,
+    MAP_SIGHT_NEAR = 1u << 8,
+};
+
+#define SIGHT_EXPLORED UINT32_C(0x80000000)
+typedef struct {
+    uint32_t *cells; /* Team sight in bits 23..30, explored in 31, detector teams in 0..7. */
+    uint32_t allies[8];
+} sightmap_t;
+
+typedef struct {
+    /* weight: 0 = day, 256 = night (DC.EXE level +0x540). */
+    int phase, tics, duration, transition, weight;
+} daylight_t;
+
+enum {
+    MAP_RENDER_CAP_CELL_COLORS = 1 << 0,
+    MAP_RENDER_CAP_TERRAIN_TRANSITIONS = 1 << 1,
+    MAP_RENDER_CAP_ZERO_TILE_EMPTY = 1 << 2,
+    MAP_RENDER_CAP_DEPTH_SORTED_TILE_LAYERS = 1 << 3,
+    MAP_RENDER_CAP_TILE_TRANSFORMS = 1 << 4,
+};
+
+enum {
+    MAP_TILE_TRANSFORM_FLIP_X = 1 << 0,
+    MAP_TILE_TRANSFORM_FLIP_Y = 1 << 1,
+};
+
+typedef enum {
+    MAP_EXTRA_DECORATION,
+    MAP_EXTRA_RESOURCE_VENT,
+    MAP_EXTRA_OVERLAY,
+} MapExtraKind;
+
+typedef struct mapextra_s {
+    MapExtraKind kind;
+    ivec2_t cell;
+    int layer;
+    int value;
+    uint32_t flags;
+} mapextra_t;
+
+#define MAP_DECORATION_MAX_ANIMATION_FRAMES 32
+
+typedef struct mapdecorationframe_s {
+    ivec2_t sprite_pivot;
+    int sprite_frame;
+    int duration_ms;
+} mapdecorationframe_t;
+
+typedef struct mapdecoration_s {
+    ivec2_t cell;
+    isize2_t footprint;
+    bool solid;
+    bool hidden;
+    bool center_anchor;
+    /* Optional authored sprite pivot.  When set, (pivot_x, pivot_y) in the
+       sprite canvas is attached directly to the decoration's (gx, gy) world
+       point.  This lets a game plugin preserve its native placement convention
+       without deriving an origin from opaque bounds or a guessed footprint. */
+    bool has_sprite_pivot;
+    ivec2_t sprite_pivot;
+    int animation_frame_count;
+    mapdecorationframe_t animation_frames[MAP_DECORATION_MAX_ANIMATION_FRAMES];
+    int frame_interval_ms;
+    int frame_index;
+    int frame2_index;
+    int frame3_index;
+    angle_t angle;
+    int render_remap;
+    uint32_t render_flags;
+    int render_selector;
+    uint32_t render2_flags;
+    int render2_selector;
+    uint32_t render3_flags;
+    int render3_selector;
+    char sprite_name[32];
+    char sprite2_name[32];
+    char sprite3_name[32];
+    char shadow_name[32];
+} mapdecoration_t;
+
+#define RTS_MAX_RESOURCES 8
+
+typedef struct resourcevent_s {
+    ivec2_t cell;
+    /* Visual/interaction attachment point inside the authored vent stamp.
+       cell remains the integer scenario coordinate used by scripts. */
+    fixed2_t attachment;
+    /* Occupied cells for click and harvest range.  0x0 means 1x1. */
+    isize2_t footprint;
+    int amount;
+    int rate;
+    bool active;
+    bool exhausts_source; /* Remove a finite patch when its contents run out. */
+    int resource_type; /* 0-based index into player_resources[][resource_type] */
+    /* Structure that yields this deposit (mobj id), or 0 for a terrain vent.
+       Neutral deposits or the structure's allies may harvest it; it closes when the
+       structure dies. Kept by P_SyncDepositStructures. */
+    uint32_t source_id;
+    /* Yield per trip once the deposit is empty (a depleted geyser); 0 closes it. */
+    int depleted_rate;
+    bool depleted;
+    /* The gatherer working an exclusive deposit and the tic it last said so:
+       a heartbeat, so a worker that dies or leaves frees the deposit a tic later. */
+    uint32_t occupant;
+    int occupied_at;
+} resourcevent_t;
+
+/* A deposit a gatherer can still draw from: stocked, or empty yet trickling. */
+static inline bool P_VentYields(const resourcevent_t *vent) {
+    return vent && vent->active && (vent->amount > 0 || vent->depleted);
+}
+
+/* Movement classes (wheels, tracks, feet, hover...). Class 0 means "plain": the
+ * unit only respects blocked[]. Classes 1.. look up a speed percentage per
+ * terrain id or overlay effect id; 0 is impassable, 25 is a swamp crawl and 200
+ * is a road. A game that has no terrain classes simply leaves `speeds` NULL. */
+#define RTS_MAX_MOVE_CLASSES 16
+typedef struct {
+    int class_count;
+    uint8_t terrain[RTS_MAX_MOVE_CLASSES][16];
+    uint8_t overlay[RTS_MAX_MOVE_CLASSES][8];
+    uint8_t max_slope[RTS_MAX_MOVE_CLASSES]; /* Authored; needs an elevation map to apply. */
+    /* Side of the square block of cells a unit of the class covers; 0 means 1.
+     * The planner keeps such a unit where its whole block is open (P_NavNodePoint). */
+    uint8_t footprint[RTS_MAX_MOVE_CLASSES];
+} terrainspeeds_t;
+
+/* How the level ended for the local player (game/g_outcome.c). */
+typedef enum { OUTCOME_NONE, OUTCOME_VICTORY, OUTCOME_DEFEAT, OUTCOME_DRAW } outcome_t;
+/* Kills and losses by owner since the level started, for result screens,
+ * and the scenario team + 1 the owner's units carried (0 until one is seen). */
+typedef struct { int kills, losses; uint8_t team; } sidestats_t;
+
+typedef struct level_s {
+    char map_path[1024];
+    int width;
+    int height;
+    uint16_t *tile_ids;
+    uint16_t *tile_overlays[MAX_TILE_OVERLAYS];
+    uint8_t *tile_transforms[MAX_TILE_OVERLAYS + 1];
+    int tile_overlay_count;
+    uint8_t *blocked;
+    terrainspeeds_t *speeds;
+    uint8_t *cell_terrain; /* Game terrain id per cell, indexes speeds->terrain. */
+    uint8_t *cell_effect;  /* Overlay effect id per cell (0..7), 255 = none. */
+    uint8_t *cell_solid;   /* Impassable to every class; 7legion reserves bit 1 for live buildings. */
+    uint16_t *tile_flags;
+    sightmap_t sight;
+    daylight_t daylight;
+    uint32_t *cell_colors;
+    uint32_t render_capabilities;
+    mapdecoration_t *decorations;
+    int decoration_count;
+    resourcevent_t *resource_vents;
+    int resource_vent_count;
+    mapextra_t *extras;
+    int extra_count;
+    bool has_camera;
+    fvec2_t camera;
+    int player_resources[8][RTS_MAX_RESOURCES];
+    uint16_t income_scale[8]; /* 8.8 credit multiplier per owner; 0 means 1.0. */
+    bool player_teams; /* Independent players use the alliance masks. */
+    uint8_t player_colors[8];
+    char tileset_name[32];
+    void *native_data;
+    void (*destroy_native_data)(void *);
+    void *mission;
+    void (*destroy_mission)(void *);
+    struct nav_s *nav; /* Planner cache (p_nav.c); validates itself against blocked[]. */
+    /* Research tiers by actor type and owner: Dark Colony's DEPEND rows,
+     * Warcraft's weapon and shield lines. Part of the lockstep checksum. */
+    struct { uint8_t weapon, armor; } upgrades[RTS_MAX_UPGRADE_TYPES][8];
+    /* The local result (game/g_outcome.c): owners that have held units,
+     * those seen hostile to the local player, and kills and losses. Saved
+     * with the game; not part of the lockstep checksum, as foes is local. */
+    outcome_t outcome;
+    uint8_t sides, foes;
+    sidestats_t side_stats[8];
+    LEVEL_GAME_FIELDS /* Per-game level state, from the game's game_config.h. */
+    void (*render_transitions)(app_t *app, const struct level_s *map, const tileset_t *tileset,
+                               int x, int y, int dx, int dy);
+    uint32_t next_mobj_id;
+    uint32_t next_move_order_id;
+    uint8_t random_index;
+} level_t;
+
+/* The one place that knows a bottom-up world (Dark Colony) meets a top-down
+ * screen. Everything else keeps native coordinates and converts through these.
+ * The flip is its own inverse, so L_WorldYF also maps screen rows to world. */
+static inline float L_ScreenYF(const level_t *map, float y) {
+#if RTS_WORLD_Y_UP
+    return (float)map->height - y;
+#else
+    (void)map;
+    return y;
+#endif
+}
+
+static inline float L_WorldYF(const level_t *map, float y) {
+    return L_ScreenYF(map, y);
+}
+
+/* A native offset or displacement (pixels) as a screen delta. */
+static inline int L_ScreenDY(int dy) {
+    return RTS_WORLD_Y_UP ? -dy : dy;
+}
+
+/* Screen row of a cell's top edge: the cell spans world [y, y + 1], so its
+ * top edge is y + 1 when the world runs upward. */
+static inline float L_CellScreenYF(const level_t *map, int y) {
+    return L_ScreenYF(map, (float)(y + RTS_WORLD_Y_UP));
+}
+
+static inline int L_ScreenY(const level_t *map, int y) {
+    return (int)L_CellScreenYF(map, y);
+}
+
+extern level_t level;
+
+
+/* DC has eight route destinations. DR's native traversal modes are 0/1/2. */
+enum { MAXWAYPOINTS = 8 };
+typedef enum { WP_BACKTRACK, WP_LOOP, WP_ONCE } waypointmode_t;
+typedef struct {
+    ivec2_t points[MAXWAYPOINTS];
+    int count, current;
+    waypointmode_t mode;
+    bool backwards;
+} waypoints_t;
+
+
+typedef struct mobj_s mobj_t;
+typedef struct app_s app_t;
+typedef struct spritecache_s spritecache_t;
+typedef struct gameinfo_s gameinfo_t;
+typedef bool (*harvestdropoffmatchf_t)(const mobj_t *unit, int resource_type,
+                                     const mobj_t *base, fixed2_t *position);
+typedef struct production_s production_t;
+typedef void (*actionf_p1)(mobj_t *mo);
+typedef struct thinker_s {
+    struct thinker_s *prev, *next;
+    actionf_p1 function;
+} thinker_t;
+
+typedef enum {
+    MF_SELECTABLE = 1u << 0,
+    MF_MOBILE = 1u << 1,
+    MF_RENDERABLE = 1u << 2,
+    MF_ATTACK = 1u << 3,
+    MF_HARVESTER = 1u << 4,
+    MF_RESOURCE_BASE = 1u << 5,
+    MF_FLY = 1u << 6,
+    MF_SELECTED = 1u << 7,
+    MF_DONTDRAW = 1u << 8,
+    MF_NOBLOCKMAP = 1u << 9, /* Non-interacting puff, blood, or light mobj. */
+    MF_MISSILE = 1u << 10,
+    MF_TURRET = 1u << 11, /* An emplacement that turns in place to aim (a type's `turret` is a sub-sprite). */
+    MF_LANDMINE = 1u << 12,
+    MF_DETECTOR = 1u << 13,
+    MF_HUMAN = 1u << 14,
+    MF_HEAL = 1u << 15,
+    MF_REPAIR = 1u << 16,
+    MF_NOAUTOTARGET = 1u << 17,
+    /* Structure that yields a resource deposit (KKnD drill rig): the engine
+     * keeps a resource vent on it that only its allies' harvesters use. */
+    MF_RESOURCE_SOURCE = 1u << 18,
+    /* Unseen and untargetable by enemies unless one of their detectors
+     * (MF_DETECTOR sight) covers its cell. Set by data or at runtime. */
+    MF_CLOAKED = 1u << 19,
+} mobjflag_t;
+
+enum {
+    ALLEGIANCE_PLAYER = 0,
+    ALLEGIANCE_ENEMY  = 1,
+    ALLEGIANCE_ALLIED = 2,
+    ALLEGIANCE_NEUTRAL = 3,
+};
+
+/* Zero waits retain the shared one-second gathering tick and instant deposit. */
+typedef struct {
+    int capacity, load_amount, unload_amount, interval_ms, depot_ms;
+    bool exclusive; /* One gatherer works a deposit at a time; the rest wait or move on. */
+} harvestresource_t;
+
+/* Authored weapon data. Distances are map cells; fixed values are 16.16. */
+typedef struct {
+    const uint8_t *weights;
+    int size;
+    const uint16_t *damage_factors; /* 8.8 multipliers by armor class. */
+    int armor_classes;
+} blastdef_t;
+
+typedef struct {
+    fixed_t step;
+    int period_ms, lifetime;
+    bool timed;
+    const fixed_t *arc; /* Height per flight tick, indexed by remaining fraction. */
+    int arc_count;
+    const int8_t *weave;
+    int weave_count, weave_step;
+    uint16_t trail_type;
+} missiledef_t;
+
+enum { MOBJ_TARGET_GROUND = 1 << 0, MOBJ_TARGET_AIR = 1 << 1 };
+
+/* Damage around a weapon's target (StarCraft weapons.dat explosion types).
+ * Radial hits everyone but the attacker, enemy spares the attacker's allies,
+ * air hits only flyers. Ground and radial splash stay on the target's layer. */
+enum { SPLASH_NONE, SPLASH_RADIAL, SPLASH_ENEMY, SPLASH_AIR };
+
+/* One weapon. Range and radii are map cells, 16.16. */
+typedef struct {
+    fixed_t range;
+    fixed_t min_range; /* Targets nearer than this are out of reach (a sieged tank's dead zone). */
+    int damage;
+    int versus[3]; /* Damage by victim armor_class 0..2; zero uses damage. */
+    int upgrade_damage[2];
+    int cooldown_ms;
+    uint16_t projectile_type;
+    int health_cost;
+    int shots, reload_ms;
+    uint8_t targets; /* MOBJ_TARGET_* the weapon reaches; zero reaches both. */
+    uint8_t hits;    /* Hits of one attack (StarCraft max hits); zero is one. */
+    uint8_t splash;  /* SPLASH_* */
+    /* Further enemies the shot jumps to: the nearest within WEAPON_BOUNCE_RANGE
+     * of the last, not the one before it, each hit a third of the last. */
+    uint8_t bounces;
+    fixed_t radius[3]; /* Splash: full damage inside [0], half inside [1], a quarter inside [2]. */
+    uint16_t native_id; /* The game's own weapon row, for gameinfo_t.hit_damage. */
+} weapondef_t;
+#define WEAPON_BOUNCE_RANGE FIXED_FROM_INT(3) /* OpenBW glaive bounce search, 96 pixels. */
+
+typedef struct mobjtype_s {
+    uint16_t id;
+    const char *name;
+    const char *sprite_name;
+    const char *shadow_name;
+    uint32_t traits;
+    fixed_t speed; /* Cells per second, 16.16. */
+    angle_t turn_step; /* Per simulation tic; zero uses the legacy turn cadence. */
+    /* A turret that aims apart from the hull: drawn from `sprite_name` by
+     * the unit's aim, its ground point on the hull picture's mount point,
+     * turning `turn_step` a tic (zero turns at once). The unit fires once
+     * the turret is on its target and leaves its hull where it was. It
+     * shows `frame`, and attacking `fire_frame` onward as the body goes
+     * through its attack run (a negative one keeps `frame`). */
+    struct { const char *sprite_name; angle_t turn_step; int frame, fire_frame; } turret;
+    int max_hp;
+    unsigned armor_class;
+    uint16_t defense[3]; /* Native damage multipliers; zero uses 256. */
+    struct {
+        int day, night;
+        bool airborne;
+    } sight;
+    weapondef_t attack;
+    /* Against flyers when its damage is set (StarCraft's air weapons);
+     * attack serves everything else. */
+    weapondef_t air_attack;
+    missiledef_t missile;
+    blastdef_t blast;
+    struct { int state; uint16_t type; } deploy;
+    /* MF_RESOURCE_SOURCE structures: the deposit the engine opens on them. */
+    struct { int amount; int rate; int resource_type; } deposit;
+    struct {
+        int state_id;
+        int unload_state_id;
+        angle_t dock_angle;
+        harvestresource_t resources[RTS_MAX_RESOURCES];
+    } harvest;
+    uint16_t native_type_id;
+    uint8_t move_class; /* Terrain speed class (see terrainspeeds_t); 0 = plain. */
+    actionf_p1 damage_action;
+    /* Cells the actor occupies. Attack range is measured to this rectangle
+     * in tiles, as Warcraft does; zero keeps the centre-distance rule. */
+    isize2_t footprint;
+    uint16_t build_on_type; /* A refinery replaces this native resource object. */
+    bool sight_from_footprint; /* Sight spreads from every footprint cell, not the centre. */
+    /* Optional row-major foundation: ' ' ignores a cell, '=' needs clear
+     * ground but leaves it passable, 'x' blocks it. NULL fills the rectangle. */
+    const char *foundation;
+    bool corner_anchor; /* Native object position is the footprint's top-left. */
+} mobjtype_t;
+
+/* A state is a run of `count` consecutive sprite frames sharing one action,
+ * like Quake II's mmove_t. The action runs on entering every frame; nextstate
+ * follows the last. Doom's one-frame state is the count == 1 case. */
+typedef struct state_s {
+    int sprite;
+    int frame; /* First logical frame of the run. */
+    int count; /* Frames in the run; zero means one. */
+    int tics;  /* Duration of each frame, unless frame_tics lists them. */
+    actionf_p1 action;
+    int nextstate;
+    int group; /* Gameplay animation group, independent of sprite presentation. */
+    const int16_t *frame_tics; /* Optional per-frame durations, `count` entries. */
+} state_t;
+
+/* Per-frame durations of a state-table row with uneven native timing. */
+#define TICS(...) (const int16_t[]){ __VA_ARGS__ }
+
+static inline int P_StateFrames(const state_t *state) {
+    return state->count > 1 ? state->count : 1;
+}
+
+static inline int P_StateTics(const state_t *state, int frame) {
+    return state->frame_tics ? state->frame_tics[frame] : state->tics;
+}
+
+typedef struct mobjinfo_s mobjinfo_t;
+
+typedef enum {
+    RTS_STATE_COORDS_GROUND_OFFSET = 0,
+    RTS_STATE_COORDS_FIN_TOP_LEFT = 1,
+} StateCoordMode;
+
+typedef enum {
+    SELECTION_STYLE_DEFAULT = 0, /* Green sprite rectangle and health bar. */
+    SELECTION_STYLE_SPRITE,
+    SELECTION_STYLE_BRACKETS,
+} SelectionStyle;
+
+typedef struct selectionmarker_s {
+    SelectionStyle style;
+    const char *image;
+} selectionmarker_t;
+
+typedef struct unitoverlaycontext_s {
+    app_t *app;
+    const mobj_t *unit;
+    const spritecache_t *cache;
+    const gameinfo_t *game_info;
+    fvec2_t anchor;
+    irect_t bounds; /* Current sprite bounds in screen pixels. */
+} unitoverlaycontext_t;
+
+typedef void (*unitoverlaydrawf_t)(const unitoverlaycontext_t *ctx);
+
+/* Engine behaviour modes. Zero is the default of every field, so a game only
+ * names the ones it changes. */
+typedef enum {
+    INPUT_LEFT_SELECT_ORDER = 0, /* Left selects/orders, right deselects. */
+    INPUT_RIGHT_CLICK_ORDERS     /* Left selects, right orders. */
+} inputpolicy_t;
+typedef enum {
+    SIGHT_NATIVE = 0, /* The native Dark Colony ray table. */
+    SIGHT_RADIAL,     /* Simple radial field of view. */
+    SIGHT_OPEN        /* No fog of war: every team sees the whole map. */
+} sightpolicy_t;
+typedef enum {
+    TURN_GRADUAL = 0, /* Units turn over time. */
+    TURN_INSTANT      /* Units snap to a new facing. */
+} turnpolicy_t;
+typedef enum {
+    SELECT_OWN_ONLY = 0, /* Only your units can be selected. */
+    SELECT_ANY           /* With nothing of yours selected, a click can inspect any unit. */
+} selectpolicy_t;
+typedef enum {
+    F10_RESOURCE_CHEAT = 0, /* F10 grants resources. */
+    F10_CONTROL_MENU        /* F10 opens the control panel. */
+} f10policy_t;
+typedef enum {
+    STANCE_ORDERS_ONLY = 0, /* An order is whatever the click says. */
+    STANCE_MOVE_ONLY_STICKY /* Units told to move only keep ignoring enemies on later clicks. */
+} stancepolicy_t;
+typedef struct {
+    inputpolicy_t input;
+    stancepolicy_t stance;
+    sightpolicy_t sight;
+    turnpolicy_t turning;
+    selectpolicy_t select;
+    f10policy_t f10;
+} rulepolicy_t;
+
+struct gameinfo_s {
+    const char *const *sprnames;
+    int sprite_count;
+    const state_t *states;
+    int state_count;
+    const mobjinfo_t *mobjinfo;
+    int mobj_type_count;
+    int null_state;
+    StateCoordMode state_coord_mode;
+    selectionmarker_t selection_marker;
+    /* Either callback replaces the engine selection and health overlay. */
+    unitoverlaydrawf_t draw_underlays; /* Ground marks drawn before all world sprites. */
+    unitoverlaydrawf_t draw_overlays; /* Marks drawn after all world sprites. */
+    /* Sprite shadows need at least this detail setting; translucency likewise. 0: always drawn. */
+    int shadow_detail_min, blend_detail_min;
+    harvestdropoffmatchf_t harvest_dropoff_matches;
+    const uint32_t *random_table; /* Optional native 256-entry gameplay RNG. */
+    int game_speed; /* Default simulation speed in percent, 10..200; 0 means 100. */
+    const struct soundinfo_s *sound; /* NULL: the game has no sounds yet. */
+    void (*draw_fog)(app_t *app, const struct level_s *map, const tileset_t *tileset);
+    /* Optional: one hit's damage to hit points. damage is the weapon's, after
+     * the versus table; divisor (1 for a direct hit) splits it for splash and
+     * bounces once the game has added its upgrades, before armor. The game may
+     * take the hit on the target's shields and return 0. NULL: damage / divisor. */
+    int (*hit_damage)(const struct mobj_s *attacker, const weapondef_t *weapon,
+                      struct mobj_s *target, int damage, int divisor);
+    /* Optional: per-tic rules of a live actor before it moves (StarCraft
+     * shields, energy and cloaking upkeep). */
+    void (*mobj_ticker)(struct mobj_s *mobj);
+    /* Optional: an attack the game makes itself (StarCraft Carriers launch
+     * interceptors, Reavers scarabs). True when it took the attack; the
+     * engine then only starts the cooldown. */
+    bool (*attack)(struct mobj_s *attacker, const weapondef_t *weapon, struct mobj_s *target);
+    /* Optional: cells added to a weapon's reach (a StarCraft Bunker's +1). */
+    fixed_t (*range_bonus)(const struct mobj_s *attacker, const weapondef_t *weapon);
+    /* Optional: further teams (sight bits, 0x40000000 >> team) that see what
+     * this mobj sees (StarCraft Parasite). */
+    uint32_t (*sight_teams)(const struct mobj_s *mobj);
+    /* Optional: false when the game's rules keep this attacker off this
+     * victim whatever the weapon (Z robots need grenades for buildings). */
+    bool (*can_target)(const struct mobj_s *attacker, const struct mobj_s *victim);
+    /* Sprite sheets carry one palette map per team, by team id: a unit
+     * without a remap of its own draws through its team's. */
+    bool team_palettes;
+};
+
+/* State-machine and presentation fields of an ordinary mobj. */
+typedef struct mobjcore_s {
+    fixed3_t position;
+    fixed3_t momentum;
+    angle_t angle;
+    int state_id;
+    int state_frame; /* Index into the current state's run of frames. */
+    int tics;
+    int sprite_id;
+    int frame;
+    uint32_t render_flags;
+    int render_remap;
+    int render_intensity;
+    ivec2_t render_offset;
+    char sprite_name[32];
+} mobjcore_t;
+
+typedef struct {
+    uint16_t actor_id;
+    uint8_t product_class;
+    int product_type, time_ms;
+} productionitem_t;
+
+struct production_s {
+    /* Active product is stored in these fields; pending[n] is slot n+1. */
+    uint16_t actor_id;
+    uint8_t product_class;
+    int product_type;
+    int queue_count;
+    productionitem_t pending[RTS_MAX_PRODUCTION_QUEUE - 1];
+    int time_ms;
+    int time_left_ms;
+    bool blocked;
+    bool release_active;
+    bool release_ready;
+    bool placed;
+    ivec2_t cell; /* Chosen building site, retained through production. */
+};
+
+static inline productionitem_t P_ProductionItem(const production_t *queue,int slot) {
+    return slot==0?(productionitem_t){queue->actor_id,queue->product_class,
+                                       queue->product_type,queue->time_ms}:queue->pending[slot-1];
+}
+
+#include "mobj_data.h" // per-game object fields (needs m_vec types above)
+
+struct mobj_s {
+    thinker_t thinker;
+    mobjcore_t core;
+    const mobjtype_t *info;
+    fixed_t speed; /* Cells per second, 16.16. */
+    uint32_t id;
+    uint16_t type_id;
+    uint16_t native_type_id;
+    uint8_t owner;
+    uint8_t team;
+    uint8_t allegiance;
+    uint32_t traits;
+    int hp;
+    int max_hp;
+    mobj_t *target; /* Doom: missile originator, or another mobj target. */
+    struct { int clock, age, duration, phase, damage, wait; } missile;
+    struct {
+        int cooldown_left_ms;
+        int shots;
+        mobj_t *target;
+        angle_t aim; /* A turret's facing, relative to the hull's. */
+    } attack;
+    struct {
+        int target;
+        int timer_ms;
+        int cargo;
+        int resource_type;
+        int phase;
+        mobj_t *base;
+        fixed2_t return_position;
+    } harvest;
+    bool remove;
+    production_t *production;
+    fixed_t radius; /* Cells, 16.16. */
+    waypoints_t waypoints;
+    bool move_only;
+    struct {
+        fixed2_t goal;
+        navpath_t path;
+        uint32_t order_id;
+        bool order_arrived;
+        int turn_timer_ms;
+        int stuck_tics, replans;
+        fixed_t best_goal_dist; /* Closest approach to goal this order; 0 = not yet measured. */
+        fixed_t best_leg_dist;  /* Closest approach to the current waypoint; 0 = new leg. */
+        int best_leg;           /* The waypoint best_leg_dist was measured to. */
+        bool plan_pending;   /* Order accepted; the planner has not produced a route yet. */
+        uint32_t plan_seq;   /* FIFO position in the time-sliced planning queue. */
+    } movement;
+    MOBJ_GAME_FIELDS
+};
+
+static inline void P_ClearMove(mobj_t *unit) {
+    unit->movement.path = (navpath_t){0};
+    unit->movement.stuck_tics = unit->movement.replans = 0;
+    unit->movement.best_goal_dist = unit->movement.best_leg_dist = 0;
+    unit->movement.plan_pending = false;
+}
+
+static inline bool P_MobjIsSelected(const mobj_t *mobj) {
+    return mobj && (mobj->traits & MF_SELECTED) != 0;
+}
+
+static inline void P_MobjSetSelected(mobj_t *mobj, bool selected) {
+    if (!mobj) return;
+    if (selected) mobj->traits |= MF_SELECTED;
+    else mobj->traits &= ~MF_SELECTED;
+}
+
+static inline bool P_MobjIsHidden(const mobj_t *mobj) {
+    return mobj && (mobj->traits & MF_DONTDRAW) != 0;
+}
+
+static inline void P_MobjSetHidden(mobj_t *mobj, bool hidden) {
+    if (!mobj) return;
+    if (hidden) mobj->traits |= MF_DONTDRAW;
+    else mobj->traits &= ~MF_DONTDRAW;
+}
+
+static inline bool P_AreAllegiancesAllied(uint8_t a, uint8_t b) {
+    if (a == ALLEGIANCE_NEUTRAL || b == ALLEGIANCE_NEUTRAL)
+        return false;
+    if (a == b) return true;
+    if ((a == ALLEGIANCE_PLAYER || a == ALLEGIANCE_ALLIED) &&
+        (b == ALLEGIANCE_PLAYER || b == ALLEGIANCE_ALLIED))
+        return true;
+    return false;
+}
+
+bool P_IsAlly(const mobj_t *a, const mobj_t *b);
+/* Live mobj with this id, or NULL. */
+mobj_t *P_MobjById(uint32_t id);
+/* Whether `unit` may harvest `vent`: it is active and either a terrain vent
+ * or one whose source structure is alive and allied with the unit. */
+bool P_VentOpenTo(const struct level_s *map, const struct resourcevent_s *vent,
+                  const mobj_t *unit);
+/* Opens a vent on every living MF_RESOURCE_SOURCE structure (reusing closed
+ * slots) and closes the vents of dead ones. Runs every tick. */
+void P_SyncDepositStructures(struct level_s *map);
+
+extern thinker_t thinkercap;
+extern int leveltime;
+void P_InitThinkers(void);
+void P_AddThinker(thinker_t *thinker);
+void P_RemoveThinker(thinker_t *thinker);
+void P_RunThinkers(void);
+void P_FreeThinkers(void);
+void P_MobjThinker(mobj_t *mobj);
+void P_TickWaypoints(mobj_t *actor);
+bool P_CanTarget(const mobj_t *attacker, const mobj_t *victim);
+mobj_t *P_SpawnMobj(fixed3_t position, uint16_t type);
+mobj_t *P_SpawnMissile(mobj_t *source, mobj_t *target, uint16_t type);
+void P_ExplodeMissile(mobj_t *missile);
+void A_Explode(mobj_t *actor);
+bool P_Deploy(mobj_t *actor);
+void A_Deploy(mobj_t *actor);
+void P_RemoveMobj(mobj_t *mobj);
+void P_InitMobj(const gameinfo_t *game_info, mobj_t *unit);
+/* Non-owning snapshots for rendering/UI and batch RTS orders. The thinker list
+ * alone owns objects; these pointers never move or compact their storage. */
+typedef struct { mobj_t **items; int count; } mobjlist_t;
+mobjlist_t P_ListMobjs(void);
+void P_FreeMobjList(mobjlist_t *list);
+
+bool P_SetMobjState(mobj_t *unit, int state_id);
+/* Enters one frame of a state's run; a frame past its end enters nextstate. */
+bool P_SetMobjStateFrame(mobj_t *unit, int state_id, int frame);
+bool P_TickMobjState(mobj_t *unit);
+production_t *P_EnsureMobjProduction(mobj_t *unit);
+void P_FreeMobjProduction(mobj_t *unit);
+
+/* State-entry actions, matching Hexen's state_t action model. */
+void A_Look(mobj_t *unit);
+void A_Chase(mobj_t *unit);
+void A_Attack(mobj_t *unit);
+
+/* Move toward movement.goal at unit->speed.  Physical displacement belongs
+ * to the movement system, not to a state-entry action. */
+
+
+/* RTS replacement for Doom's movement/buttons. A group order is atomic. */
+#define MAXCOMMANDUNITS 1024
+typedef enum {
+    TC_NONE, TC_ORDER, TC_MOVE, TC_HARVEST, TC_ATTACK, TC_STOP, TC_BUILD, TC_DEPLOY,
+    TC_PURCHASE, TC_SUBMIT, TC_MODE, TC_WAYPOINT, TC_PAUSE,
+    TC_PATH, TC_ALLY, TC_SHARE_SIGHT, TC_GIVE, TC_SPEED, TC_CHAT, TC_RETURN_GOODS,
+    TC_CONSTRUCT, /* units[0] builds `product` at position; product 0 cancels the site in units. */
+    TC_REPAIR, TC_STAND_GROUND, TC_SPELL,
+    TC_BOARD, TC_UNLOAD,
+    TC_CANCEL_PRODUCTION, TC_SET_RALLY,
+    TC_FOLLOW, TC_LIFT, TC_LAND,
+    TC_RESYNC, /* Network only: one chunk of a resync save, never queued or run. */
+    TC_MAX = TC_RESYNC
+} ticorder_t;
+
+/* Lockstep consistency is hashed per subsystem so a desync names where it
+ * started. The vector travels with every ticcmd; G_Consistency folds it. */
+typedef enum {
+    CONSISTENCY_GLOBALS, CONSISTENCY_RESOURCES, CONSISTENCY_UPGRADES,
+    CONSISTENCY_THINKERS, CONSISTENCY_GAME, CONSISTENCY_COUNT
+} consistency_t;
+
+typedef struct {
+    uint32_t consistancy; /* G_Consistency() of the state this command's tic was built after. */
+    uint32_t subsystems[CONSISTENCY_COUNT]; /* The vector it folds, one hash per subsystem. */
+    ticorder_t order;
+    fixed3_t position;
+    uint32_t target;
+    int product;
+    unsigned count;
+    uint32_t units[MAXCOMMANDUNITS];
+    waypoints_t path; /* TC_PATH installs the complete route atomically. */
+    char text[128]; /* TC_CHAT: bounded UTF-8 message, target is recipient mask. */
+} ticcmd_t;
+
+extern bool paused;
+
+void G_BuildTiccmd(ticcmd_t *cmd);
+bool G_QueueTiccmd(const ticcmd_t *cmd);
+void G_ClearTiccmds(void);
+void G_RunTiccmd(int player, const ticcmd_t *cmd);
+extern const char *const g_consistency_names[CONSISTENCY_COUNT];
+uint32_t G_HashValue(uint32_t hash, uint32_t value); /* FNV-1a over four bytes. */
+void G_ConsistencyVector(uint32_t out[CONSISTENCY_COUNT]);
+uint32_t G_Consistency(void);
+
+/* Game hooks. game/g_hooks.c supplies weak defaults that do nothing; a game
+ * defines the ones it needs, so shared code never branches on which game it is. */
+/* Hash state of the game's own into the CONSISTENCY_GAME subsystem. */
+uint32_t G_ConsistencyExtra(uint32_t hash);
+/* A command that needs no unit (alliances, purchases): true when consumed. */
+bool G_GameCommand(int player, const ticcmd_t *cmd);
+/* False for a unit that cannot be commanded right now (e.g. aboard a ship). */
+bool G_UnitCommandable(const mobj_t *unit);
+/* A command over resolved units; true when the game consumed it. `target` may be NULL. */
+bool G_GameUnitCommand(int player, const ticcmd_t *cmd, mobj_t *const *units,
+                       int count, mobj_t *target);
+/* Called twice per order, before it takes effect: phase 0 for orders that
+ * replace what the unit was doing, phase 1 for TC_ORDER once it is accepted. */
+void G_InterruptOrders(const ticcmd_t *cmd, mobj_t *const *units, int count, bool late);
+/* A campaign script may ask the camera to jump to a map cell. */
+bool G_TakeCameraRequest(fvec2_t *cell);
+/* Release level data the game allocated (P_FreeLevel). */
+void G_FreeLevelData(level_t *map);
+/* Environment clock (WORLD_CLOCK_MS): `begin` runs on each clock step before
+ * daylight; `end` runs every tic after it and owns the fog refresh cadence. */
+void G_ClockBegin(int64_t clock);
+void G_ClockEnd(int64_t before, int64_t clock);
+/* Alliance bit masks per owner that decide who is friendly to the AI. */
+const uint32_t *G_AllianceMasks(const level_t *map);
+/* Start of a production tick, before queues advance. */
+void G_ProductionBegin(int elapsed_ms);
+void G_UnitProduced(mobj_t *unit, const mobj_t *producer);
+void G_UnitKilled(mobj_t *victim, mobj_t *killer);
+/* Distinguishes save bodies whose layout the game changed. */
+uint32_t G_SaveLayout(void);
+bool G_NetSignature(const char *map_path, uint32_t *signature);
+bool G_SelectedTiccmd(ticorder_t order, mobj_t *const *units, int count,
+                     fixed2_t position, uint32_t target);
+bool G_BuildOrder(mobj_t *producer, int product);
+/* Send one builder to put up actor type `type` with its top-left cell at
+ * `cell`, or cancel a site under construction (TC_CONSTRUCT). */
+bool G_ConstructOrder(mobj_t *builder, int type, ivec2_t cell);
+bool G_CancelConstructionOrder(mobj_t *site);
+bool G_PathOrder(mobj_t *const *units, int count, const waypoints_t *path);
+/* Sight. G_SightRadius may change an actor's radius, or return false to give
+ * it no sight (aboard a ship). */
+bool G_SightRadius(const mobj_t *actor, int *radius);
+/* The cooldown after a unit fires weapon, given the weapon's own: Stim Packs
+ * or Ensnare may shorten or lengthen it. */
+int G_WeaponCooldown(const mobj_t *unit, const weapondef_t *weapon, int cooldown_ms);
+/* False when a viewer (owner and ally row `team`, 8 for none) must not see
+ * `target` whatever the fog says: units aboard a ship. */
+bool G_ViewerSees(const mobj_t *target, int owner, int team);
+/* An order to harvest at a position over resolved units; true when the game
+ * handles it itself (`*issued` says whether any unit took it). */
+bool G_GameHarvestAt(mobj_t *const *units, int count, fixed2_t position, bool *issued);
+
+
+/* Eight seats, not Doom's four: Warcraft II person slots and the resource,
+ * sight and alliance rows are already eight. Nodes and players are one to
+ * one, so this stays inside MAXNETNODES. */
+#define MAXPLAYERS 8
+#define MAXNETNODES 8
+_Static_assert(MAXPLAYERS <= MAXNETNODES, "one network node per player");
+#define BACKUPTICS 12
+#define DOOMCOM_ID UINT32_C(0x12345678)
+#define NCMD_EXIT UINT32_C(0x80000000)
+#define NCMD_RETRANSMIT UINT32_C(0x40000000)
+#define NCMD_SETUP UINT32_C(0x20000000)
+#define NCMD_KILL UINT32_C(0x10000000)
+#define NCMD_RESYNC UINT32_C(0x08000000)
+#define NCMD_CHECKSUM UINT32_C(0x07ffffff)
+
+typedef struct {
+    uint32_t checksum;
+    uint8_t retransmitfrom, starttic, player, numtics;
+    ticcmd_t cmds[BACKUPTICS];
+} doomdata_t;
+
+typedef struct {
+    uint32_t id;
+    int command, remotenode, datalength;
+    int numnodes, numplayers, consoleplayer, ticdup, extratics;
+    doomdata_t data;
+} doomcom_t;
+
+enum { CMD_SEND = 1, CMD_GET = 2 };
+extern doomcom_t *doomcom;
+extern doomdata_t *netbuffer;
+extern bool netgame, netready, nodeingame[MAXNETNODES], playeringame[MAXPLAYERS];
+extern bool netactive;
+extern int consoleplayer, gametic, maketic, ticdup;
+extern int game_speed;
+typedef struct { int sound, music, detail; } gamesettings_t;
+extern gamesettings_t gamesettings;
+const char *D_UserDirectory(void);
+void D_LoadSettings(void);
+bool D_SaveSettings(int speed);
+
+/* Where the lockstep check first disagreed, for the message and for tests:
+ * the tic whose state differs, the tic that noticed, the other player, and a
+ * bit per consistency_t subsystem that differs. */
+extern struct netdesync_s { int tic, detected, player; unsigned subsystems; } netdesync;
+/* Tic packets of another resync epoch fail their checksum and are dropped. */
+extern uint32_t net_epoch;
+/* How a desync is repaired: save serializes this peer's whole game (malloc'd),
+ * load replaces the game with a received save. With handlers set, the lowest
+ * seated player's state is sent to the others and every peer reloads it at the
+ * same tic boundary; without them a desync ends the game. */
+typedef struct {
+    bool (*save)(void **data, size_t *length);
+    bool (*load)(const void *data, size_t length);
+} netresync_t;
+void D_SetNetResync(const netresync_t *handlers);
+extern int netresyncs; /* Completed resyncs this game. */
+extern int nettics[MAXNETNODES];
+extern ticcmd_t netcmds[MAXPLAYERS][BACKUPTICS];
+extern char neterror[256];
+
+/* Remove network switches from argv before the game parses its arguments. */
+bool I_InitNetwork(int *argc, char **argv);
+/* Host distributes a data-root-relative map before any level is loaded. */
+bool I_StartNetGame(const char *game, char *map, size_t capacity);
+bool I_NetJoining(void);
+typedef struct {
+    char address[64], name[32], map[512];
+    int players, capacity;
+    uint64_t id, seen;
+} netgame_t;
+/* Menu sessions use the same transport as --host/--join, without blocking. */
+bool I_HostNetGame(const char *game, const char *name, const char *map, int players);
+/* Host-only, before launch: reserve this many slots, never fewer than have joined. */
+bool I_SetNetPlayers(int players);
+/* Host-only: up to 64 opaque bytes delivered to every joiner (I_NetSetup). */
+bool I_SetNetSetup(const void *data, size_t size);
+size_t I_NetSetup(void *data, size_t capacity);
+/* Host-only: start a menu session once every reserved slot has joined. */
+bool I_LaunchNetGame(void);
+/* Joiner-only: up to 8 opaque bytes for its own slot (e.g. race), sent to
+ * the host until it launches. The host reads them with I_NetChoice. */
+bool I_SetNetChoice(const void *data, size_t size);
+size_t I_NetChoice(int player, void *data, size_t capacity);
+/* Joiner has a slot (doomcom->consoleplayer) in a lobby not yet launched. */
+bool I_NetLobby(void);
+const char *I_NetMap(void); /* Host's map; a joiner learns it in the lobby. */
+/* Lobby chat before launch. The host keeps the log (ids 1..count, the last
+ * 32 retained) and relays it to every joiner; lines arrive in order. */
+enum { NETCHAT_LENGTH = 96 };
+bool I_SendNetChat(const char *line);
+int I_NetChatCount(void);
+const char *I_NetChatLine(int id);
+bool I_JoinNetGame(const char *game, const char *address);
+bool I_OpenNetBrowser(const char *game);
+void I_QueryNetGames(const char *address);
+const netgame_t *I_NetGames(int *count);
+int I_PollNetGame(char *map, size_t capacity); /* -1 error, 0 waiting, 1 ready */
+int I_NetPlayerCount(void);
+bool I_NetMenuSession(void);
+void I_CancelNetGame(void);
+void I_NetCmd(void);
+void I_ShutdownNetwork(void);
+void D_CheckNetGame(uint32_t signature);
+/* Keeps the tic clock continuous, so a running game can change speed. */
+void D_SetGameSpeed(int speed);
+void D_QuitNetGame(void);
+void NetUpdate(void);
+/* Returns available simulation tics; the driver runs each and advances gametic. */
+int TryRunTics(void);
+bool D_RunTiccmds(void);
+bool D_PlayerIsHuman(int owner);
+int ExpandTics(int low);
+
+
+typedef enum {
+    RENDER_LAYER_TERRAIN = 0,
+    RENDER_LAYER_TERRAIN_OVERLAY = 10,
+    RENDER_LAYER_DECORATION = 20,
+    RENDER_LAYER_UNIT = 30,
+    RENDER_LAYER_EFFECT = 40,
+    RENDER_LAYER_UI = 100,
+} RenderLayer;
+
+typedef enum {
+    DRAW_COMMAND_TILE_OVERLAY,
+    DRAW_COMMAND_DECORATION,
+    DRAW_COMMAND_UNIT,
+} DrawCommandKind;
+
+typedef struct drawcommand_s {
+    DrawCommandKind kind;
+    RenderLayer layer;
+    fixed_t sort_z;
+    float sort_y;
+    int stable_index;
+    union {
+        struct {
+            int x;
+            int y;
+            int layer;
+        } tile_overlay;
+        const mapdecoration_t *decoration;
+        const mobj_t *unit;
+    } ref;
+} drawcommand_t;
+
+
+typedef struct app_s app_t;
+
+typedef struct {
+    int id;
+    uint8_t indices[256];
+} spritepalettemap_t;
+
+typedef struct {
+    int value;
+    int frames[MAX_TILE_ANIMATION_FRAMES];
+    int frame_count;
+    uint16_t frame_ms;
+} TileAnimation;
+
+typedef struct spritelayer_s {
+    ivec2_t offset;
+    uint16_t lump;
+    uint8_t remap; /* Native FIN drawing mode, not a team/palette ID. */
+    uint8_t intensity;
+    uint8_t layer;
+    uint8_t flags;
+    char sprite_name[9];
+} spritelayer_t;
+
+typedef struct spritedirection_s {
+    int ticks;
+    spritelayer_t *layers;
+} spritedirection_t;
+
+typedef struct spriteframe_s {
+    int rotations; /* 1 is nondirectional; slots start north, counterclockwise. */
+    char frame_name[17];
+    spritedirection_t *directions;
+} spriteframe_t;
+
+typedef struct spritedef_s {
+    int numframes;
+    spriteframe_t *spriteframes;
+} spritedef_t;
+
+typedef struct spritelump_s {
+    uint8_t *indices;
+} spritelump_t;
+
+/* Sprite geometry, indexed by the layer cell number; no renderer resources. */
+typedef struct spritecell_s {
+    irect_t rect;
+    irect_t bounds;
+    ivec2_t ground_point;
+    ivec2_t displacement;
+    ivec2_t mount; /* Where a turret's ground point sits on this hull picture. */
+} spritecell_t;
+
+typedef struct spritesheet_s {
+    spritecell_t *cells;
+    spritelump_t *lumps;
+    int numlumps;
+    isize2_t frame_size;
+    spritedef_t spritedef;
+    bool indexed;
+    uint32_t palette[256];
+    uint32_t source_palette[256]; /* Source colors, independent of world colormaps. */
+    spritepalettemap_t *palette_maps;
+    int palette_map_count;
+    int indexed_blend_selector;
+    const uint8_t *indexed_blend_table;
+    const uint8_t *shadowmap; /* Destination colormap for native projected shadows. */
+} spritesheet_t;
+
+typedef struct tilepalettecycle_s {
+    uint8_t *tiles;
+    uint8_t indices[256];
+    int count;
+    uint16_t frame_ms;
+} tilepalettecycle_t;
+
+typedef struct tileset_s {
+    uint8_t *indices; /* Contiguous native tiles, one byte per pixel. */
+    uint32_t palette[256];
+    tilepalettecycle_t palette_cycle;
+    int *tile_lookup;
+    int tile_lookup_count;
+    TileAnimation *animations;
+    int animation_count;
+    int count;
+    int atlas_cols;
+    int tile_w;
+    int tile_h;
+    int draw_y_offset;
+    /* Optional native terrain light-selector rows at full intensity, indexed
+     * by night level 0..7 (DC.EXE 0x40a7b3/0x44ee68). Zero means none. */
+    int light_row_count;
+    uint8_t light_rows[8][256];
+} tileset_t;
+
+typedef struct cachedsprite_s {
+    char name[32];
+    spritesheet_t sprite;
+    const spritesheet_t *alias; /* Borrowed image for another native resource name. */
+} cachedsprite_t;
+
+typedef struct spritecache_s {
+    cachedsprite_t entries[MAX_DECORATION_SPRITES];
+    int count;
+    const spritesheet_t **sprites; /* Borrowed sheets, indexed by state sprite ID. */
+    int numsprites;
+    const spritesheet_t **turrets; /* Borrowed turret sheets, indexed by unit type ID. */
+    int numturrets;
+    struct spritecache_s *ui; /* Owned images keyed by path, outside the state registry. */
+} spritecache_t;
+
+typedef struct bitmapfont_s {
+    spritesheet_t sprite;
+    int glyph_index[256];
+    uint8_t glyph_width[256];
+    int glyph_limit; /* glyphs a game defines: 0 means ASCII (128); bytes past it draw '?' */
+    isize2_t glyph_size;
+    int line_h;
+    int draw_divisor;
+    bool native_origin; /* Draw cells at their authored displacement. */
+    /* Its colours are its own: menus match them into the screen palette. */
+    bool own_palette;
+} bitmapfont_t;
+
+#define RTS_MAX_HUD_MESSAGES 8
+
+typedef struct {
+    char text[256];
+    int ttl_ms;
+} HudMessage;
+
+typedef struct hudtext_s {
+    HudMessage messages[RTS_MAX_HUD_MESSAGES];
+    int count;
+} hudtext_t;
+extern hudtext_t chat_text;
+
+
+#define SCREENWIDTH  640
+#define SCREENHEIGHT 480
+
+#ifdef RTS_NATIVE_WORLD
+#define DEFAULT_WINDOW_WIDTH  (SCREENWIDTH * 2)
+#define DEFAULT_WINDOW_HEIGHT (SCREENHEIGHT * 2)
+#else
+#define DEFAULT_WINDOW_WIDTH  SCREENWIDTH
+#define DEFAULT_WINDOW_HEIGHT SCREENHEIGHT
+#endif
+
+static inline int R_UIScale(const app_t *app) {
+#ifdef RTS_NATIVE_WORLD
+    if (app) {
+        int scale = app->win.w / SCREENWIDTH;
+        int vertical = app->win.h / SCREENHEIGHT;
+        if (scale > vertical) scale = vertical;
+        if (scale > 0) return scale;
+    }
+#else
+    (void)app;
+#endif
+    return 1;
+}
+
+enum {
+    V_FLIP_X = 1u << 0,
+    V_FLIP_Y = 1u << 1,
+    /* Write source index 0. Sprites skip it; opaque backgrounds do not, unless
+     * the palette marks entry 0 transparent (alpha 0). Transparency is decided
+     * on the source index, before any remap. */
+    V_OPAQUE = 1u << 2
+};
+
+typedef struct {
+    uint8_t *pixels; /* w*h palette indices, row-major, pitch == w */
+    int w, h;
+} vscreen_t;
+
+extern vscreen_t screens[1];
+extern uint32_t vpalette[256];
+
+void V_AllocScreen(int w, int h);
+void V_FreeScreen(void);
+void V_BeginFrame(uint32_t clear_argb);
+/* Drawing coordinates are logical UI pixels while a menu is being drawn. */
+void V_SetDrawScale(int scale);
+int V_GetDrawScale(void);
+isize2_t V_DrawSize(void);
+void I_SetPalette(const uint32_t argb[256]);
+bool I_ReadScreen(uint8_t *dst);
+uint8_t V_NearestIndex(uint32_t argb);
+/* Source index -> screen index. Identity when the palette matches the screen.
+ * The result is only valid until the next palette-resolving call. */
+const uint8_t *V_RemapPalette(const uint32_t palette[256]);
+/* Multiply source RGB by an 0xAARRGGBB color, then nearest-match the screen. */
+void V_ModulateRemap(uint8_t out[256], const uint32_t palette[256], uint32_t color);
+void V_ReadPixels(uint32_t *dst, int dst_pitch_bytes);
+
+void V_SetClip(irect_t clip);
+irect_t V_GetClip(void);
+
+void V_FillRect(irect_t r, uint8_t color);
+void V_FillRectTranslucent(irect_t r, uint32_t argb);
+void V_DrawLine(ivec2_t a, ivec2_t b, uint8_t color);
+void V_DrawPoint(ivec2_t p, uint8_t color);
+void V_DrawRectOutline(irect_t r, uint8_t color);
+void V_DrawBlock(ivec2_t at, const uint8_t *src, isize2_t size, int src_pitch,
+                 const uint8_t *remap, uint32_t flags);
+void V_DrawBlockScaled(irect_t dst, const uint8_t *src, isize2_t size, int src_pitch,
+                       const uint8_t *remap, uint32_t flags);
+void V_DrawBlockTranslucent(ivec2_t at, const uint8_t *src, isize2_t size, int src_pitch,
+                            const uint8_t *table, uint32_t flags);
+void V_DrawSilhouetteColormap(ivec2_t at, const uint8_t *src, isize2_t size, int src_pitch,
+                              const uint8_t *colormap, uint32_t flags);
+
+void V_DrawSpriteCell(ivec2_t at, const spritesheet_t *sheet, int cell,
+                      const uint8_t *remap, uint32_t flags);
+void V_DrawSpriteCellScaled(irect_t dst, const spritesheet_t *sheet, int cell,
+                            const irect_t *src, const uint8_t *remap, uint32_t flags);
+
+int V_TextWidth(const bitmapfont_t *font, const char *text);
+/* Horizontal advance and authored vertical glyph extent, relative to origin. */
+irect_t V_TextBounds(const bitmapfont_t *font, const char *text);
+/* Existing engine fallback glyphs, positioned in the supplied logical space. */
+void V_DrawSmallText(irect_t box, const char *text, uint32_t argb, isize2_t space);
+void V_DrawText(ivec2_t at, const bitmapfont_t *font, const char *text, const uint8_t *remap);
+void V_DrawTextScaled(ivec2_t at, const bitmapfont_t *font, const char *text,
+                      const uint8_t *remap, int scale);
+void V_DrawTextWrapped(irect_t box, const bitmapfont_t *font, const char *text,
+                       const uint8_t *remap, int scroll_px);
+int V_TextWrappedHeight(int width, const bitmapfont_t *font, const char *text);
+
+bool R_DrawIndexed(const uint8_t *indices, isize2_t size, const uint32_t palette[256],
+                   const uint8_t *remap, const irect_t *src, const irect_t *dst,
+                   uint32_t flags);
+bool R_DrawSprite(const spritesheet_t *sprite, int frame, int palette,
+                  const irect_t *src, const irect_t *dst, uint32_t flags, int intensity);
+
+
+/* Present renderer. Drawing does not use it. */
+extern SDL_Renderer *r_renderer;
+
+
+uint16_t read_u16_le(const uint8_t *p);
+int32_t read_i32_le(const uint8_t *p);
+uint32_t read_u32_le(const uint8_t *p);
+
+bool W_ReadFile(const char *path, blob_t *out);
+void W_FreeFile(blob_t *blob);
+SDL_Surface *W_LoadImage(const char *path);
+/* Decode a BMP or PCX into one indexed spritesheet cell. Owns the lump pixels. */
+bool W_LoadIndexedSheet(const char *path, spritesheet_t *out);
+/* Eight-bit IFF ILBM/PBM, optionally ByteRun1, including its CMAP. */
+bool W_DecodeLBM(const blob_t *file, spritesheet_t *out);
+bool W_LoadGIFTexture(const char *path, spritesheet_t *out);
+/* Temporary strings survive seven further M_va calls on this thread.
+ * Returns NULL on formatting failure or overflow; copy results kept longer. */
+char *M_va(const char *format, ...) __attribute__((format(printf, 1, 2)));
+const char *M_FileName(const char *path);
+char *M_Upper(char *text);
+void M_PathJoin(char *dst, size_t dst_size, const char *a, const char *b);
+int clamp255(int value);
+void V_IndexedToRGBA(uint32_t *dst, const uint8_t *src, size_t count, const uint32_t palette[256]);
+void V_BlitIndexed(uint32_t *dst, int dst_w, int dst_h, int dst_x, int dst_y,
+                   const uint8_t *src, int src_w, int src_h, const uint32_t palette[256]);
+bool R_AllocSpriteCells(spritesheet_t *sprite, int count);
+void R_FreeSpriteBuffer(void);
+void R_DropIndexed(const uint8_t *base, size_t bytes);
+bool R_RenderIndexedBlend(app_t *app, const spritesheet_t *sprite, int frame,
+                          irect_t dst, uint32_t flags, int selector);
+bool R_RenderSpriteShadow(app_t *app, const spritesheet_t *sprite, int frame,
+                          irect_t ground_dst, uint32_t flags);
+bool R_AddTileAnim(tileset_t *tileset, int value, const int *frames,
+                   int frame_count, uint16_t frame_ms);
+const uint8_t *R_PaletteMap(const spritesheet_t *sprite, int id);
+void HU_DrawText(ivec2_t at, const bitmapfont_t *font, const char *text,
+                 const uint8_t *remap, int scale);
+void HU_DrawTextWrapped(irect_t box, const bitmapfont_t *font, const char *text,
+                        const uint8_t *remap, int scale);
+int HU_TextWidth(const bitmapfont_t *font, const char *text, int scale);
+void HU_PushMessage(hudtext_t *hud, const char *text, int ttl_ms);
+void HU_Ticker(hudtext_t *hud, float dt);
+
+/* Cell lookups sit in every movement and pathfinding loop: inline. */
+static inline int L_Index(const level_t *map, int x, int y) {
+#ifdef RTS_LEVEL_COLUMN_MAJOR
+    return x * map->height + y;
+#else
+    return y * map->width + x;
+#endif
+}
+static inline ivec2_t L_Cell(const level_t *map, int index) {
+#ifdef RTS_LEVEL_COLUMN_MAJOR
+    return (ivec2_t){index / map->height, index % map->height};
+#else
+    return (ivec2_t){index % map->width, index / map->width};
+#endif
+}
+static inline bool L_Contains(const level_t *map, int x, int y) {
+    return x >= 0 && y >= 0 && x < map->width && y < map->height;
+}
+static inline bool L_IsWalkable(const level_t *map, int x, int y) {
+    return L_Contains(map, x, y) && (!map->blocked || map->blocked[L_Index(map, x, y)] == 0) &&
+        (!map->cell_solid || !map->cell_solid[L_Index(map, x, y)]);
+}
+/* Speed percentage for a movement class at a cell (0 = impassable). Class 0 is the
+ * plain blocked[] grid; other classes read the game's terrain speed tables. */
+static inline int L_MoveSpeed(const level_t *map, int move_class, int x, int y) {
+    if (!L_Contains(map, x, y)) return 0;
+    int index = L_Index(map, x, y);
+    if (move_class <= 0 || !map->speeds || move_class >= map->speeds->class_count)
+        return L_IsWalkable(map, x, y) ? 100 : 0;
+    if (map->cell_solid && map->cell_solid[index]) return 0;
+    int effect = map->cell_effect ? map->cell_effect[index] : 255;
+    if (effect < 8) return map->speeds->overlay[move_class][effect];
+    return map->speeds->terrain[move_class][(map->cell_terrain ? map->cell_terrain[index] : 15) & 15];
+}
+int P_FindPath(const level_t *map, cell_t start, cell_t goal, cell_t *out_path, int max_path);
+void P_NavFree(level_t *map);
+bool P_NavReachable(const level_t *map, int move_class, ivec2_t from, ivec2_t to);
+/* The connected component of each cell for a movement class (0 = impassable),
+ * valid until the terrain arrays change: a loop can test many cells against
+ * one validation instead of one per P_NavReachable. NULL when out of memory. */
+const uint16_t *P_NavRegions(const level_t *map, int move_class);
+/* Nearest cell to `wanted` in the same region as `from`, within `radius` cells. */
+bool P_NavNearestReachable(const level_t *map, int move_class, ivec2_t from,
+                           ivec2_t wanted, int radius, ivec2_t *out);
+/* Nav nodes. A class covering n x n cells plans on node (x, y): the block whose
+ * top-left cell is (x - n/2, y - n/2). An odd block centres on a cell, so its
+ * nodes are cells; an even one centres on a cell corner. Regions and every
+ * ivec2_t of the P_Nav calls above are nodes of the class. */
+int P_NavFootprint(const level_t *map, int move_class);
+fixed2_t P_NavNodePoint(const level_t *map, int move_class, ivec2_t node);
+ivec2_t P_NavNodeAt(const level_t *map, int move_class, fixed2_t at);
+/* Nodes whose block touches the w x h footprint at `cell` without overlapping
+ * it, row by row from the top-left. Returns how many were written to `out`. */
+int P_NavRing(const level_t *map, int move_class, ivec2_t cell, isize2_t size, ivec2_t *out, int max);
+
+void R_GridToScreen(const app_t *app, float gx, float gy, float *sx, float *sy);
+cell_t R_ScreenToGrid(const app_t *app, int sx, int sy);
+void R_MapToScreen(const app_t *app, const level_t *map, float gx, float gy,
+                   float *sx, float *sy);
+void R_MapPositionToScreen(const app_t *app, const level_t *map,
+                           fixed3_t position, float *sx, float *sy);
+cell_t R_ScreenToMapGrid(const app_t *app, const level_t *map, int sx, int sy);
+void R_RefreshViewport(app_t *app);
+void R_WindowToRenderPt(const app_t *app, int wx, int wy, int *rx, int *ry);
+void R_WindowToRenderDelta(const app_t *app, int wx, int wy, float *rx, float *ry);
+void R_DrawCell(app_t *app, int gx, int gy, uint32_t argb);
+void R_DrawTile(app_t *app, const tileset_t *tileset, int tile, irect_t src_part, irect_t dst_part);
+/* The level's tileset palette is the screen palette. R_DrawLevel installs it
+ * every frame; loading installs it so the first clear already uses it. */
+void R_SetLevelPalette(const tileset_t *tileset);
+void R_DrawLevel(app_t *app, const level_t *map, const tileset_t *tileset);
+void R_DrawGridOverlay(app_t *app, const level_t *map);
+int R_PickUnit(const app_t *app, const level_t *map, mobj_t *const *units, int unit_count,
+               const spritesheet_t *fallback_sprite, const spritecache_t *cache,
+               const gameinfo_t *game_info, int x, int y, int owner_filter);
+void R_DrawDecorations(app_t *app, const level_t *map, const spritecache_t *cache);
+void R_DrawThings(app_t *app, mobj_t *const *units, int unit_count, const spritesheet_t *fallback_sprite,
+                  const spritecache_t *cache, const gameinfo_t *game_info, uint32_t ticks);
+void R_DrawBuildingPreview(app_t *app, uint16_t type, ivec2_t cell, int team,
+                           const spritecache_t *cache);
+const mobjtype_t *P_ActorType(uint16_t type);
+fixed2_t P_BuildingPosition(uint16_t type, ivec2_t cell);
+bool P_BuildingCellClear(uint16_t type, ivec2_t cell, const mobj_t *builder);
+bool P_CanPlaceBuilding(uint16_t type, ivec2_t cell, const mobj_t *builder);
+void P_SyncBuildingBlocking(void);
+/* In-place morph (Zerg egg, Lair, Sunken Colony): the mobj keeps its id,
+ * owner, place and selection, takes the new type's actor and state, and
+ * keeps its share of hit points. */
+bool P_MorphMobj(mobj_t *mo, uint16_t type);
+void R_RenderPlayerView(app_t *app, const level_t *map, const tileset_t *tileset,
+                        mobj_t *const *units, int unit_count, const spritesheet_t *fallback_sprite,
+                        const spritecache_t *cache, const gameinfo_t *game_info, uint32_t ticks);
+cachedsprite_t *R_CacheFind(spritecache_t *cache, const char *name);
+bool R_BindSprites(spritecache_t *cache, const gameinfo_t *game_info);
+/* The sheet a unit's turret draws from, bound with the state sprites. */
+const spritesheet_t *R_TurretSprite(const spritecache_t *cache, const mobj_t *u);
+const spritesheet_t *R_StateSprite(const spritecache_t *cache, const gameinfo_t *game_info,
+                                   int sprite, const char *name);
+const spritesheet_t *R_CacheLookup(const spritecache_t *cache, const char *name);
+bool R_InitSpriteDef(spritesheet_t *sprite, int numframes, int rotations);
+bool R_AllocSpriteDirections(spriteframe_t *frame, int rotations);
+bool R_InstallSpriteLump(spritesheet_t *sprite, int frame, int rotation,
+                         int lump, bool flip);
+
+void P_MoveOrder(const level_t *map, mobj_t *const *units, int unit_count, cell_t goal);
+bool P_HasMoveOrder(const mobj_t *unit);
+void P_MoveOrderAt(const level_t *map, mobj_t *const *units, int unit_count,
+                         fixed2_t goal_position);
+bool P_MoveUnitTo(const level_t *map, mobj_t *unit, fixed2_t goal_position);
+bool P_HarvestOrderAt(const level_t *map, mobj_t *const *units, int unit_count,
+                             fixed2_t position);
+bool P_HarvestUnitTo(const level_t *map, mobj_t *unit, fixed2_t position);
+void P_InitMobj(const gameinfo_t *game_info, mobj_t *unit);
+void P_ApplyActorTypeDefaults(mobj_t *unit, const mobjtype_t *type);
+bool P_SetMobjState(mobj_t *unit, int state_id);
+bool P_TickMobjState(mobj_t *unit);
+bool P_Attack(mobj_t *attacker);
+/* The weapon attacker uses on target: air_attack against a flyer when it has
+ * one, otherwise attack. A NULL target gives attack. */
+const weapondef_t *P_MobjWeapon(const mobj_t *attacker, const mobj_t *target);
+/* Whether target lies within attacker's weapon range (see mobjtype_t.footprint). */
+bool P_InAttackRange(const mobj_t *attacker, const mobj_t *target);
+irect_t P_MobjCells(const mobj_t *unit);
+void P_DamageMobj(mobj_t *target, mobj_t *source, int damage);
+angle_t P_PointToAngle(fixed_t dx, fixed_t dy);
+void P_AngleToVec(angle_t angle, fixed_t *dx, fixed_t *dy);
+void P_Ticker(void);
+void G_Responder(app_t *app, const level_t *map, mobj_t *const *units, int unit_count,
+                 const spritesheet_t *fallback_sprite, const spritecache_t *cache,
+                 const gameinfo_t *game_info, const SDL_Event *e);
+void G_CameraMove(app_t *app, float dt);
+void R_ClampCamera(app_t *app, const level_t *map, int viewport_w, int viewport_h);
+
+void R_FreeTileset(tileset_t *tileset);
+void P_FreeLevel(level_t *map);
+bool P_InitSight(void);
+void P_UpdateSight(void);
+void P_RevealSight(ivec2_t origin, int radius, uint32_t mask, bool airborne);
+bool P_VisibleToPlayer(const mobj_t *mobj);
+bool P_VisibleTo(const mobj_t *observer, const mobj_t *target);
+/* Teams (sight bits 23..30) whose MF_DETECTOR sight covers the mobj's cell. */
+uint32_t P_Detectors(const mobj_t *mobj);
+int P_SightBrightness(const level_t *map, ivec2_t cell);
+int R_FogSample(const int corners[4], ivec2_t pixel);
+void R_DrawFog(app_t *app, const level_t *map);
+void R_DrawMinimapFog(const level_t *map, irect_t rect);
+void R_DrawFogTiles(app_t *app, const level_t *map, const tileset_t *tileset);
+void R_FreeSprite(spritesheet_t *sprite);
+void HU_FreeFont(bitmapfont_t *font);
+void R_FreeSpriteCache(spritecache_t *cache);
+
+
+/* ── sound: Doom's s_sound.c over an i_sound.c mixer ──────────────────────
+ * Simulation code starts sounds as Doom's P_ code does; playback is local
+ * presentation and never touches game state or the gameplay RNG, so peers in
+ * a lockstep game may hear different things. Every call is a no-op until
+ * S_Init succeeds, which keeps headless and model builds silent. */
+
+#define MAXSFXLINKS 10
+
+/* One playable sound, or a Hexen SNDINFO-style random group of them. */
+typedef struct sfxinfo_s {
+    char name[64];      /* Relative WAV path, or label if data is already decoded. */
+    int priority;       /* Bark priority: lower wins (DC SLIST); 0 for samples. */
+    int instances;      /* Simultaneous plays allowed; 0 is unlimited. */
+    int volume;         /* Attenuation in centibels, <= 0 (DirectSound units). */
+    bool loop;
+    int16_t links[MAXSFXLINKS]; /* Group members: sfx ids. */
+    int numlinks;
+    int next;           /* Group cursor: the member the next play uses. */
+    bool norepeat;      /* Group re-rolls its cursor away from the last member. */
+    struct sfxsample_s *data; /* Engine-owned sample; games use S_LoadSound. */
+} sfxinfo_t;
+
+/* Actor events a game maps to sounds. */
+typedef enum {
+    SE_NONE,
+    SE_SELECT,   /* Bark: the local player selected the unit. */
+    SE_ACK,      /* Bark: the local player ordered the unit. */
+    SE_ATTACK,   /* Weapon fire. */
+    SE_DEATH,
+    SE_DEPLOY,
+    SE_EXPLODE,  /* A missile's impact. */
+    SE_ATTACKED, /* A local player's object took damage (alert). */
+    SE_ACTIVE,   /* Looping sound while the actor exists (engines, drills). */
+    SE_READY,    /* Bark: a trained unit is ready. */
+    SE_WORK_COMPLETE,
+    SE_RESEARCH_COMPLETE,
+    SE_WORK,     /* A worker's tool strikes its resource. */
+    NUMSOUNDEVENTS
+} soundevent_t;
+
+typedef enum {
+    UI_SOUND_CLICK,   /* Control activated. */
+    UI_SOUND_MESSAGE, /* Message line shown. */
+    UI_SOUND_SCREEN,  /* Menu screen opened (DC loops it while open). */
+    UI_SOUND_GADGET,  /* Menu gadget entrance. */
+    NUMUISOUNDS
+} uisound_t;
+
+/* A game's sound definition, referenced by gameinfo_t.sound. */
+typedef struct soundinfo_s {
+    /* Registers sfx; may supply native WAV bytes through S_LoadSound.
+     * False frees partial samples and leaves the game silent. */
+    bool (*init)(const char *data_root);
+    /* Per-level data such as tileset ambience. */
+    void (*level_start)(const level_t *map, const char *data_root);
+    /* Sfx id for an actor event, or 0. */
+    int (*actor_sound)(const mobj_t *actor, soundevent_t event);
+    /* Once per rendered frame after the listener moves: ambience. */
+    void (*ticker)(const app_t *app, const level_t *map);
+    int ui[NUMUISOUNDS]; /* Sfx ids; 0 is silent. */
+    /* Distance attenuation in centibels per squared cell, and the silence
+     * threshold. DC.EXE 0x42ec44: d^2/2 with -8000 as the cutoff. */
+    float rolloff;
+    int cutoff;
+} soundinfo_t;
+
+extern bool nosound;
+extern int snd_volume; /* Master volume percent, 0..100. */
+
+/* Opens the audio device and loads the game's sounds. */
+bool S_Init(const char *data_root);
+void S_Shutdown(void);
+/* Game tables add sfx in order; returns the id (ids start at 1), or 0. */
+int S_AddSfx(const sfxinfo_t *sfx);
+sfxinfo_t *S_Sfx(int id);
+/* Loads an uncached sample from native WAV bytes. The engine owns the decoded
+ * sample; callers retain the input. Groups and already loaded ids are rejected. */
+bool S_LoadSound(int id, const void *bytes, size_t size);
+/* Stops world sounds and loads the level's own sound data. */
+void S_Start(const level_t *map, const char *data_root);
+/* Positional sound following origin; NULL origin plays at full volume. */
+int S_StartSound(const mobj_t *origin, int sfx);
+int S_StartSoundAt(fixed2_t position, int sfx);
+/* Listener-relative (UI, barks, ambience). */
+int S_StartLocalSound(int sfx);
+void S_StartUISound(uisound_t sound);
+void S_StopUISound(uisound_t sound);
+/* Doom S_StopSound: every channel the origin started. */
+void S_StopSound(const mobj_t *origin);
+/* A freed origin keeps its one-shot sounds at its last position; loops stop. */
+void S_UnlinkMobj(const mobj_t *origin);
+void S_StopAllSounds(void);
+/* Sets snd_volume (0..100) and applies it to the sounds already playing. */
+void S_SetVolume(int percent);
+bool S_IsPlaying(int handle);
+void S_StopChannel(int handle);
+/* Resolves the event through the game and plays it if the local player can
+ * see the actor's cell. */
+int S_ActorSound(const mobj_t *actor, soundevent_t event);
+/* Plays one bark for the local player's units among `units`: the highest
+ * priority (lowest number) sound. selected_only limits it to the selection. */
+void S_Bark(mobj_t *const *units, int count, soundevent_t event, bool selected_only);
+/* Moves the listener to the world view's centre, repositions sounds that
+ * follow objects and runs the game's ambience. Call once per frame. */
+void S_UpdateSounds(const app_t *app, const level_t *map);
+/* Presentation-only random numbers (Doom's M_Random), not the gameplay RNG. */
+int S_Random(void);
+/* Whether the local player currently sees the cell at position. */
+bool S_PositionVisible(const level_t *map, fixed2_t position);
+
+/* i_sound.c: platform mixer. Volumes are 0..256 per side. */
+typedef struct sfxsample_s sfxsample_t;
+bool I_InitSound(void);
+void I_ShutdownSound(void);
+sfxsample_t *I_LoadSample(const char *path);
+/* Decodes an in-memory WAV; the input remains owned by the caller. */
+sfxsample_t *I_LoadSampleMemory(const void *bytes, size_t size);
+void I_FreeSample(sfxsample_t *sample);
+int I_StartSound(const sfxsample_t *sample, int left, int right, bool loop);
+void I_UpdateSoundParams(int handle, int left, int right);
+void I_StopSound(int handle);
+bool I_SoundIsPlaying(int handle);
+
+
+#define RTS_MODEL_MAX_SNAPSHOT_UNITS 128
+#define RTS_MODEL_MAX_SNAPSHOT_DECORATIONS MAX_DECORATIONS
+#define RTS_MODEL_MAX_PLAYERS 8
+#define RTS_MODEL_MAX_RESOURCES 8
+#define RTS_MODEL_MAX_PRODUCT_PREREQUISITES 4
+#define RTS_MODEL_UI_SCRIPT_BYTES 4096
+
+typedef struct RtsGameModel RtsGameModel;
+
+typedef struct {
+    /* Root data directory for the game. Defaults to g_game_default_root when NULL. */
+    const char *data_root;
+    /* Relative-to-data-root or absolute mission/map path. Defaults to g_game_default_map. */
+    const char *map_path;
+} RtsGameModelConfig;
+
+typedef enum {
+    RTS_GAME_COMMAND_NONE = 0,
+    RTS_GAME_COMMAND_SELECT_ALL_PLAYER_UNITS,
+    RTS_GAME_COMMAND_SELECT_UNIT_INDEX,
+    RTS_GAME_COMMAND_MOVE_SELECTED,
+    RTS_GAME_COMMAND_HARVEST_SELECTED,
+    RTS_GAME_COMMAND_ACTIVATE_UI_BUTTON,
+    RTS_GAME_COMMAND_ATTACK_UNIT,
+    RTS_GAME_COMMAND_BUILD_PRODUCT,
+    RTS_GAME_COMMAND_DEPLOY_SELECTED,
+    RTS_GAME_COMMAND_PATH_SELECTED,
+    RTS_GAME_COMMAND_STOP_SELECTED,
+} RtsGameCommandKind;
+
+typedef enum {
+    RTS_GAME_EVENT_NONE = 0,
+    RTS_GAME_EVENT_UNIT_ARRIVED,
+    /* A player order was accepted and placed in a producer queue. */
+    RTS_GAME_EVENT_BUILD_QUEUED,
+    RTS_GAME_EVENT_BUILD_STARTED,
+    /* Compatibility/general completion event; use the typed events below. */
+    RTS_GAME_EVENT_BUILD_FINISHED,
+    RTS_GAME_EVENT_UNIT_BUILT,
+    RTS_GAME_EVENT_BUILDING_BUILT,
+    /* Production could not proceed (for example, a blocked release point). */
+    RTS_GAME_EVENT_BUILD_BLOCKED,
+    RTS_GAME_EVENT_UNIT_DIED,
+    RTS_GAME_EVENT_ATTACK_STARTED,
+} RtsGameEventType;
+
+typedef enum {
+    RTS_RENDER_TRAIT_SELECTABLE = 1u << 0,
+    RTS_RENDER_TRAIT_MOBILE = 1u << 1,
+    RTS_RENDER_TRAIT_RENDERABLE = 1u << 2,
+    RTS_RENDER_TRAIT_ATTACK = 1u << 3,
+    RTS_RENDER_TRAIT_HARVESTER = 1u << 4,
+} RtsRenderTrait;
+
+typedef enum {
+    RTS_PRODUCT_BUILDING = 1,
+    RTS_PRODUCT_UNIT = 2,
+    RTS_PRODUCT_UPGRADE = 3,
+} RtsProductClass;
+
+typedef struct {
+    int row_id;
+    int ui_id;
+    const char *label;
+    int cost;
+    int icon_frame;
+    RtsProductClass product_class;
+    int product_type;
+    int faction;
+    int prerequisites[RTS_MODEL_MAX_PRODUCT_PREREQUISITES];
+    int prerequisite_count;
+    int makers[RTS_MODEL_MAX_PRODUCT_PREREQUISITES];
+    int maker_count;
+    int extra_costs[RTS_MAX_RESOURCES - 1];
+    bool worker_build;
+} StaticProductDefinition;
+
+bool G_PlaceProduct(mobj_t *producer, const StaticProductDefinition *product, ivec2_t cell);
+/* Whether a producer with a queue refuses a product other than the queued
+ * one. Most games queue one product at a time. */
+bool G_QueueLocksProduct(const StaticProductDefinition *product);
+bool P_ApproachFootprint(mobj_t *unit, ivec2_t cell, isize2_t size, fixed2_t *bay);
+bool P_ApproachResourceVent(mobj_t *unit, const resourcevent_t *vent,
+                            int vent_index, fixed2_t *bay);
+
+typedef struct {
+    RtsGameCommandKind kind;
+    union {
+        struct {
+            int unit_index;
+            bool additive;
+        } select_unit_index;
+        struct {
+            fixed2_t target;
+        } move_selected;
+        waypoints_t path_selected;
+        struct {
+            fixed2_t target;
+        } harvest_selected;
+        struct {
+            int ui_id;
+        } activate_ui_button;
+        struct {
+            uint32_t target_id;
+            int target_index; /* Compatibility fallback; prefer target_id. */
+        } attack_unit;
+        struct {
+            uint32_t producer_id;
+            int producer_index; /* Compatibility fallback; prefer producer_id. */
+            int ui_id;
+        } build_product;
+    } data;
+} RtsGameCommand;
+
+typedef struct {
+    RtsGameEventType type;
+    uint64_t tick;
+    uint32_t subject_id;
+    uint32_t target_id;
+    uint16_t subject_type_id;
+    uint16_t target_type_id;
+    uint8_t subject_owner;
+    uint8_t target_owner;
+    int product_class;
+    int product_type;
+    fixed2_t position;
+} RtsGameEvent;
+
+typedef struct {
+    fvec2_t position;
+    fvec2_t move_goal;
+    uint16_t type_id;
+    uint8_t owner;
+    uint32_t traits;
+    int hp;
+    int max_hp;
+    int frame;
+    int facing_code;
+    int state_id;
+    uint32_t id;
+    uint32_t render_flags;
+    int render_remap;
+    int render_intensity;
+    ivec2_t render_offset;
+    bool selected;
+    bool has_move_order;
+    int harvest_target;
+    bool hidden;
+    char sprite_name[32];
+    char shadow_name[32];
+} RtsRenderUnit;
+
+
+
+typedef struct {
+    ivec2_t cell;
+    isize2_t footprint;
+    bool hidden;
+    bool center_anchor;
+    bool has_sprite_pivot;
+    ivec2_t sprite_pivot;
+    int frame_interval_ms;
+    int frame_index;
+    int frame2_index;
+    int frame3_index;
+    int facing_code;
+    int render_remap;
+    uint32_t render_flags;
+    int render_selector;
+    uint32_t render2_flags;
+    int render2_selector;
+    uint32_t render3_flags;
+    int render3_selector;
+    char sprite_name[32];
+    char sprite2_name[32];
+    char sprite3_name[32];
+    char shadow_name[32];
+} RtsRenderDecoration;
+
+typedef struct {
+    int map_width;
+    int map_height;
+    int unit_count;
+    int decoration_count;
+    int resource_vent_count;
+    int player_resources[RTS_MODEL_MAX_PLAYERS][RTS_MODEL_MAX_RESOURCES];
+    RtsRenderUnit units[RTS_MODEL_MAX_SNAPSHOT_UNITS];
+    RtsRenderDecoration decorations[RTS_MODEL_MAX_SNAPSHOT_DECORATIONS];
+    /*
+     * Quake-style declarative UI emitted by the model/server.
+     * Example:
+     *   x 516 y 92 btn 206 enabled 1 pic 129
+     *   x 524 y 126 text "Exo-Ctr 2000"
+     */
+    char ui_script[RTS_MODEL_UI_SCRIPT_BYTES];
+} RtsRenderSnapshot;
+
+typedef struct {
+    /* Original game UI/button id. For Dark Colony this comes from INTRFACE/MAINE. */
+    int ui_id;
+    char label[40];
+    int cost;
+    int icon_frame;
+    RtsProductClass product_class;
+    /* Original game product row/type, not an internal actor id. */
+    int product_type;
+    int faction;
+    int prerequisite_count;
+    /* Original product row/types required before this product is enabled. */
+    int prerequisites[RTS_MODEL_MAX_PRODUCT_PREREQUISITES];
+    bool available;
+} RtsProductDefinition;
+
+RtsGameModel *rts_game_model_create(void);
+void rts_game_model_destroy(RtsGameModel *model);
+
+/* Loads or reloads a game/model instance. This does not create a window or renderer. */
+bool rts_game_model_load(RtsGameModel *model, const RtsGameModelConfig *config);
+/* Advances one model tic. With D_CheckNetGame active, pumps networking and
+ * advances only when all commands are present, using RTS_TICK_MS. While waiting,
+ * returns true without advancing gametic; false reports a network/load error. */
+bool rts_game_model_tick(RtsGameModel *model, int dt_ms);
+/* Applies local selection; world orders are queued when D_CheckNetGame is active.
+ * Otherwise retains immediate commands for manually ticked headless clients. */
+bool rts_game_model_command(RtsGameModel *model, const RtsGameCommand *command);
+/* Pops the oldest simulation transition event. Returns false when empty. */
+bool rts_game_model_poll_event(RtsGameModel *model, RtsGameEvent *out);
+/* Produces presentation-neutral state for a renderer or test to inspect. */
+bool rts_game_model_snapshot(const RtsGameModel *model, RtsRenderSnapshot *out);
+/* Returns product definitions with availability computed from current model state. */
+int rts_game_model_products(const RtsGameModel *model, RtsProductDefinition *out, int max_products);
+
+const char *rts_game_model_last_error(const RtsGameModel *model);
+/* Computer-player state (stats and event log) for inspection by tests and tools. */
+struct AiContext;
+struct AiContext *rts_game_model_ai(RtsGameModel *model);
+int rts_game_model_player_resources(const RtsGameModel *model, int player, int resource_type);
+
+
+/*
+ * Doom-style game interface.  Every game binary defines these externs in its
+ * own games/{GameDir}/plugin.c (or game.c).  The engine calls them by name —
+ * no vtable, no dlopen, no registry.
+ *
+ * Include this header from both the engine side (engine calls) and the game
+ * side (game implements).
+ */
+
+
+/* ── game identity ─────────────────────────────────────────────────────── */
+extern const char *const g_game_id;
+extern const char *const g_game_name;
+extern const char *const g_game_default_root;
+extern const char *const g_game_default_map;
+extern const char *const g_game_default_sprite;
+extern const int g_cell_w;
+extern const int g_cell_h;
+extern const uint16_t g_debug_enemy_type;
+extern const gameinfo_t *gameinfo;
+extern const mobjtype_t *const actor_types;
+extern const int num_actor_types;
+
+/* ── game functions ────────────────────────────────────────────────────── */
+
+/* Convert native game metadata into the engine's canonical runtime format. */
+void     G_InitGame(void);
+
+/* Load the map at path into *out.  Returns true on success. */
+bool     G_DoLoadLevel(const char *path, level_t *out);
+
+/* Load tile/sprite assets into tileset and unit_sprite. */
+bool     W_LoadAssets(const char *root, const level_t *map,
+                      const char *sprite, tileset_t *tileset, spritesheet_t *unit_sprite);
+
+/* Spawn initial map objects into the thinker list.
+   Returns the number of mobjs spawned, or 0 on none/error. */
+int      P_LoadThings(const char *path);
+
+/* Load per-unit sprites into cache after units are known.
+   Returns true on success (partial loads are allowed). */
+bool     R_InitSprites(const char *root, const level_t *map,
+                       mobj_t *const *mobjs, int count, spritecache_t *cache);
+
+/* Load the game UI font into *font.  Returns false if the game has no font. */
+bool     HU_LoadFont(const char *root, bitmapfont_t *font);
+
+/* Advance mission state by dt seconds. */
+void     G_MissionTicker(level_t *map, mobj_t *const *mobjs, int *count,
+                         hudtext_t *hud, int dt_ms);
+
+/* ── level outcome (game/g_outcome.c) ───────────────────────────────────── */
+
+/* Elimination rules that G_LevelObjectives leaves to the engine. */
+enum { ELIMINATE_DEFEAT = 1, ELIMINATE_VICTORY = 2, ELIMINATE_ALL = 3 };
+
+/* Once per tic after the mission ticker: the game's objectives, then the
+ * engine's elimination rules. Ends the level at most once. */
+void      G_OutcomeTicker(mobj_t *const *units, int count);
+/* End the level for the local player (a script's Victory action, a reached
+ * objective). Later calls are ignored; the first one shows the result. */
+void      G_EndLevel(outcome_t outcome);
+outcome_t G_LevelOutcome(void);
+/* The rules for custom maps, over every mobj in the world. A side is lost
+ * once none of its units remain.
+ * The local player is defeated when its side is lost and wins once no
+ * hostile side remains. A network match ends for every peer on the same tic,
+ * when the surviving sides are all allied; each peer then shows its own
+ * result. Allies are judged by P_IsAlly, as combat judges them. */
+void      G_CheckElimination(unsigned rules);
+const sidestats_t *G_SideStats(int owner);
+/* Count a side unit's death (play/p_mobj.c, as it dies). */
+void      G_RecordKill(const mobj_t *victim, const mobj_t *killer);
+/* The engine's plain result screen: the outcome and a Continue button that
+ * leaves the level. The default G_ShowOutcome. */
+void      G_ResultScreen(outcome_t outcome);
+
+/* Hooks, with weak defaults in game/g_hooks.c. G_LevelObjectives checks the
+ * game's own objectives, may call G_EndLevel, and returns the ELIMINATE_*
+ * rules that still apply; the default leaves every map to elimination. */
+unsigned  G_LevelObjectives(mobj_t *const *units, int count);
+/* An owner slot that takes part in elimination (not rescue or neutral). */
+bool      G_PlayerSide(int owner);
+/* A unit that keeps its owner's side alive. */
+bool      G_UnitHoldsSide(const mobj_t *unit);
+/* Show the result: the game's own victory or defeat screen. */
+void      G_ShowOutcome(outcome_t outcome);
+
+/* ── front end and HUD tables ───────────────────────────────────────────── */
+
+/* Load the front end's assets. The engine routes input to the screens. */
+bool     G_InitMenus(app_t *app, const char *root);
+/* The screen Escape opens, built for the level or for the main menu; NULL
+ * keeps the front end closed. */
+menu_t  *G_ControlPanel(app_t *app, bool inlevel);
+void     G_ShutdownMenus(void);
+
+/* Build the in-level HUD table, or NULL if the game has none. */
+menu_t  *G_InitHUD(app_t *app, const char *root);
+void     G_ShutdownHUD(void);
+
+/* Advance game-specific production queues in interactive mode. Returns true if a unit was spawned. */
+bool     G_UpdateProduction(level_t *map, mobj_t *const *units, int *unit_count, int dt_ms);
+
+/* The part of the screen that shows the world, in screen pixels. */
+irect_t  G_WorldViewport(const app_t *app);
+int      G_WorldViewportWidth(const app_t *app);
+
+/* ── headless model hooks ───────────────────────────────────────────────── */
+
+/* Query static products supported by the game. Returns count. */
+int      G_ModelGetProducts(const RtsGameModel *model, int owner,
+                            StaticProductDefinition *out, int max_products);
+
+/* Query alien production products. Returns count. */
+int      G_ModelAlienProducts(StaticProductDefinition *out, int max_products);
+
+/* Lookup a static product definition by its UI ID. */
+const StaticProductDefinition *G_ModelProductByUIId(const RtsGameModel *model, int ui_id);
+
+/* Lookup a static product definition by class and product type. */
+const StaticProductDefinition *G_ModelProductByClassType(const RtsGameModel *model,
+                                                         int product_class,
+                                                         int product_type);
+
+/* Check if prerequisites are satisfied for an owner to build a product. */
+bool     G_ModelProductAvailable(const RtsGameModel *model, int owner,
+                                 const StaticProductDefinition *product);
+bool     G_ModelProductAvailableForUnits(mobj_t *const *units, int unit_count,
+                                          const StaticProductDefinition *product);
+
+/* Find the producer mobj index for a product. Returns -1 if no eligible producer. */
+int      G_ModelFindProducerIndex(const RtsGameModel *model, int owner,
+                                  const StaticProductDefinition *product);
+
+/* Lookup actor type ID corresponding to a product definition. */
+uint16_t G_ModelActorIdForProduct(const StaticProductDefinition *product);
+
+/* Initial frame and state for spawned building products. */
+int      G_ModelBuildingFrameForProduct(const StaticProductDefinition *product);
+int      G_ModelBuildingStateForProduct(const gameinfo_t *game_info,
+                                        const StaticProductDefinition *product);
+
+/* Product training / build time in milliseconds. */
+int      G_ModelProductTrainingTimeMs(const StaticProductDefinition *product);
+
+/* Game-specific release animation and placement hooks (e.g. Dark Colony barracks release). */
+bool     G_ModelStartProductionRelease(RtsGameModel *model, mobj_t *producer,
+                                       const StaticProductDefinition *product,
+                                       uint16_t actor_id);
+bool     G_ModelSpecialReleaseSpawnPoint(const RtsGameModel *model, const mobj_t *producer,
+                                         const StaticProductDefinition *product,
+                                         const mobj_t *new_unit,
+                                         fixed2_t *out);
+
+/* Check if a player/owner currently possesses an alive unit of actor_id. */
+bool     G_ModelHasActorType(const RtsGameModel *model, int owner, uint16_t actor_id);
+
+/* Emit declarative UI script from model and snapshot state. */
+void     G_ModelBuildUIScript(const RtsGameModel *model,
+                              const RtsRenderSnapshot *snapshot,
+                              char *dst, size_t dst_size);
+
+/* Universal AI hooks (see play/p_ai.h). Returns the game's interface, or NULL
+ * when the game keeps only its own production AI. */
+struct AiGameInterface;
+const struct AiGameInterface *G_AiInterface(void);
+
+/* Catalog-backed owned/can_purchase/purchase hooks (game/g_ai.c) for games
+ * that buy through G_QueueProduct; goal product ids are catalog ui_ids. */
+int      G_AiCatalogOwned(int owner, int ui_id);
+int      G_AiCatalogCanPurchase(const level_t *map, int owner, int ui_id);
+bool     G_AiCatalogPurchase(level_t *map, int owner, int ui_id);
+bool     G_AiIsStructure(const mobj_t *unit); /* AiGameInterface.is_anchor */
+int      G_AiCatalogActor(int ui_id);           /* AiGameInterface.product_actor */
+
+/* Shared level production: UI and AI enqueue on the actual producer. */
+mobj_t  *G_FindProducer(int owner, const StaticProductDefinition *product);
+/* A producer whose queue holds fewer than `depth` orders. */
+mobj_t  *G_FindProducerBelow(int owner, const StaticProductDefinition *product, int depth);
+bool     G_QueueProduct(mobj_t *producer, const StaticProductDefinition *product);
+bool     G_QueueAllowsProduct(const production_t *queue, const StaticProductDefinition *product);
+/* Remove one queue slot, promoting the next product only when slot zero leaves. */
+void     G_RemoveProductionAt(mobj_t *producer, int slot);
+int G_ModelRadarLevel(int owner);
+bool     G_ModelProducerHasTech(const mobj_t *producer, const StaticProductDefinition *product);
+bool     G_PlayerBuildProduct(mobj_t *producer, const StaticProductDefinition *product);
+bool     G_ProductionTicker(int dt_ms);
+int      G_CountPlannedActors(int owner, uint16_t actor_id);
+typedef struct {
+    int ui_id;
+    int count;
+} productiongoal_t;
+void     G_ProductionGoals(const productiongoal_t *goals, int count);
+
+/* ── interactive production simulation (borrowed mobj pointers) ── */
+
+/* Enqueue a unit production order on producer. Returns false if rejected. */
+bool     G_ModelEnqueueProduction(mobj_t *producer, const StaticProductDefinition *product,
+                                  uint16_t actor_id);
+
+/* Advance production queues by dt_ms milliseconds, spawning finished units. Returns true if a unit was spawned. */
+bool     G_ModelUpdateProduction(level_t *map, mobj_t *const *units, int *unit_count,
+                                 int dt_ms);
+
+
+/*
+ * Universal computer-player layer.
+ *
+ * The engine owns scheduling, economy (harvester assignment), base defense,
+ * attack waves and a goal-ladder production planner. A game attaches an
+ * AiGameInterface that answers the game-specific questions (who is an AI and
+ * of which strength, what to build in which order, how to buy it) and selects
+ * which engine features run. With no interface attached the original generic
+ * MF_RESOURCE_BASE behavior is retained for legacy callers.
+ */
+
+#define AI_MAX_TEAMS 8
+#define AI_MAX_HARVEST_ASSIGNMENTS 32
+#define AI_MAX_VENT_TRIES 64 /* Vents considered per harvester order. */
+#define AI_DEFENSE_RADIUS FIXED_LIT(15.0)
+#define AI_ATTACK_WAVE_INTERVAL_MS 30000
+#define AI_ATTACK_WAVE_MIN_SIZE 3
+#define AI_ATTACK_WAVE_MAX_SIZE 8
+#define AI_EVENT_LOG_SIZE 256
+#define AI_MAX_WAVE_TRACK 32 /* Wave members followed for a retreat. */
+#define AI_MAX_TOWNS 16
+/* Products whose purchase the game turned down after allowing it (no site,
+ * no free builder), and how long the computer waits before asking again. */
+#define AI_MAX_REFUSED 8
+#define AI_REFUSED_WAIT_MS 2000
+/* Orders the computer stacks on one producer: shallow queues keep money
+ * free and let supply and tech in, as Blizzard's AI trains one at a time. */
+#define AI_QUEUE_DEPTH 2
+/* DC.EXE 0x419a54 runs the AI chooser only when (tick & 3) == 0. */
+#define AI_THINK_INTERVAL_TICKS 4
+
+typedef enum {
+    AI_FEATURE_ECONOMY    = 1u << 0, /* assign idle harvesters to free vents */
+    AI_FEATURE_PRODUCTION = 1u << 1, /* buy along the game's goal ladder */
+    AI_FEATURE_DEFENSE    = 1u << 2, /* rally idle fighters on base intruders */
+    AI_FEATURE_ATTACK     = 1u << 3, /* periodic attack waves */
+    AI_FEATURE_RESEARCH   = 1u << 4, /* start tech-ups a goal is waiting on */
+    AI_FEATURE_DOCTRINE   = 1u << 5, /* after the ladder: supply, workers, defenses, army mix */
+    AI_FEATURE_ALL        = 0x3Fu,
+} AiFeature;
+
+typedef enum {
+    AI_LEVEL_NONE = 0, /* Human, empty slot or scripted: the AI never acts. */
+    AI_LEVEL_NORMAL = 1,
+    AI_LEVEL_PLUS = 2,
+    AI_LEVEL_COUNT
+} AiLevel;
+
+typedef enum {
+    AI_BUY_OK = 0,
+    AI_BUY_BLOCKED,       /* missing prerequisite/producer or already owned */
+    AI_BUY_NEED_CREDITS,  /* possible with more credits: the AI saves up */
+    AI_BUY_NEED_TECH,     /* a producer exists but lacks the tech: see develop() */
+} AiBuyStatus;
+
+/* Keep at least `count` of `product` (alive plus queued) once `after_ms` of
+ * game time has passed. Product ids are opaque to the engine. */
+typedef struct {
+    int product;
+    int count;
+    int after_ms;
+} AiGoal;
+
+#define AI_MAX_GOALS 96
+
+/* What an actor type is for, as the planner sees it. The engine derives
+ * most roles from mobjtype_t; g_ruleset.actors adds the rest. */
+typedef enum {
+    AI_ROLE_WORKER      = 1u << 0,  /* gathers resources */
+    AI_ROLE_SUPPLY      = 1u << 1,  /* raises the supply cap: depot, pylon, overlord, farm */
+    AI_ROLE_FIGHTER     = 1u << 2,  /* mobile combat unit */
+    AI_ROLE_DEFENSE     = 1u << 3,  /* static defense: tower, bunker, cannon */
+    AI_ROLE_HITS_GROUND = 1u << 4,
+    AI_ROLE_HITS_AIR    = 1u << 5,
+    AI_ROLE_FLYER       = 1u << 6,
+    AI_ROLE_DETECTOR    = 1u << 7,
+    AI_ROLE_CLOAKED     = 1u << 8,  /* unseen without a detector */
+    AI_ROLE_SUPPORT     = 1u << 9,  /* caster or healer: travels with waves */
+} AiRole;
+
+/* The planner's view of an actor type. Strengths follow Brood War's
+ * calculate_unit_strengths (OpenBW bwgame.h): sqrt of reach plus
+ * hp x damage rate, kept apart against ground and air targets so that
+ * armies compare by summing and anti-air shows up as its own number. */
+typedef struct {
+    uint32_t roles;      /* AiRole mask */
+    int hp;              /* hit points plus shields */
+    int ground_strength; /* Nonzero from describe() overrides the formula. */
+    int air_strength;
+} AiUnitInfo;
+
+/* A product the doctrine may buy. Weight is the fighter's share of the
+ * army mix; 0 buys it only for a role need (workers, supply, detection,
+ * static defense). */
+typedef struct {
+    int product;
+    int weight;
+} AiChoice;
+
+#define AI_MAX_ROSTER 24
+
+/* A faction's strengths as numbers. The goal ladder is the opening, like
+ * the build/train lines of a Blizzard aiscript; the doctrine runs the game
+ * after it: supply, workers, detection, static defense, a counter-weighted
+ * army and when to attack or fall back. Zero switches a behavior off, so a
+ * plan without a doctrine keeps the ladder-and-timer AI. */
+typedef struct {
+    AiChoice roster[AI_MAX_ROSTER];
+    int roster_count;
+    int workers;        /* Workers kept per town (cluster of drop-offs). */
+    int supply_buffer;  /* Free supply kept ahead of demand, in game supply units. */
+    int defenses;       /* Static defenses kept per town; unarmed sites are armed in place. */
+    int research;       /* 0..100: upgrades per fighter fielded; one per 100/research fighters. */
+    int army_cap;       /* Fighters massed before buying stops; 0 is supply-bound. */
+    int expand_workers; /* Workers per town at which another town is founded; 0 never expands. */
+    int expand_after;   /* Product owned before the first expansion; 0 for none. */
+    int max_towns;      /* Towns it spreads to at most, counting the first; 0 for no limit. */
+    int scout;          /* Product whose purchase sends a scout to the start locations; 0 never scouts. */
+    int counter;        /* 0..100: how far the mix bends toward what was scouted. */
+    int attack_ratio;   /* % of the enemy army estimate an idle army needs to attack. */
+    int retreat_ratio;  /* % of local enemy strength under which a wave turns home. */
+} AiDoctrine;
+
+typedef struct {
+    AiGoal goals[AI_MAX_GOALS]; /* Priority order; earlier goals are served first. */
+    int goal_count;
+    int wave_interval_ms;       /* 0 selects AI_ATTACK_WAVE_INTERVAL_MS. */
+    int wave_min_size;          /* 0 selects AI_ATTACK_WAVE_MIN_SIZE. */
+    int wave_max_size;          /* 0 selects AI_ATTACK_WAVE_MAX_SIZE. */
+    AiDoctrine doctrine;
+} AiPlan;
+
+/*
+ * Ruleset. Each game's games/<id>/rules.c defines one const g_ruleset in C
+ * with designated initializers; the simulation and the computer player read
+ * it and never name a game. It holds what a game is, apart from its unit
+ * catalog (StaticProductDefinition: cost, producer, time, building
+ * prerequisites) and unit stats, which stay in their own tables:
+ *  - factions: the opening ladder and AiDoctrine of each side, per AiLevel;
+ *  - actors: AiRole masks (and strength inputs) per actor type;
+ *  - requirements: tech and upgrade conditions the catalog cannot say;
+ *  - patch: how a map's stat overrides are applied to a writable copy.
+ *  - policy: input, sight, turning... modes a game picks instead of a flag.
+ */
+
+/* One build/train line of a faction's opening: keep `count` of `product`. */
+typedef struct {
+    int product;
+    int count;
+} AiStep;
+
+/* What a melee start spawns: `count` actors of `type`, the first `offset` from
+ * the start location and each next one `step` further on, in the game's own
+ * map units (pixels in StarCraft, cells in Warcraft II). */
+typedef struct {
+    uint16_t type;
+    int count;
+    ivec2_t offset, step;
+} startunit_t;
+
+typedef struct {
+    uint16_t type;
+    ivec2_t at;
+} startplace_t;
+
+typedef struct {
+    const char *name;                       /* "Zerg", "Orc", "Gray", "Imperium"... */
+    const startunit_t *start_units;         /* what a melee start location spawns */
+    int start_unit_count;
+    const AiStep *opening;                  /* aiscript-style build/train lines */
+    int opening_count;
+    int wave_interval_ms, wave_min_size, wave_max_size;
+    AiDoctrine doctrine;                    /* AI_LEVEL_NORMAL */
+    /* Optional per-level replacement doctrine (AI_LEVEL_PLUS...); NULL keeps
+     * `doctrine`. */
+    const AiDoctrine *level_doctrine[AI_LEVEL_COUNT];
+    /* Optional variants the game picks per owner (ruleset_t.variant_of):
+     * Warcraft II's sea and air scripts play the same race another way. */
+    const struct factionvariant_s *variants;
+    int variant_count;
+} faction_t;
+
+/* A variant replaces the opening, raises or adds roster weights and may set
+ * the number of defenses; everything else is the faction's. */
+typedef struct factionvariant_s {
+    const AiStep *opening;
+    int opening_count;
+    const AiChoice *roster;
+    int roster_count;
+    int defenses;
+} factionvariant_t;
+
+/* Freeciv-style requirement: what an owner must have before buying a product. */
+typedef enum {
+    REQ_BUILDING = 1, /* an actor of type `id` stands */
+    REQ_TECH,         /* a producer of the product has reached tech `level` */
+    REQ_UPGRADE,      /* upgrade `id` is at least at `level` for the owner */
+} requirementkind_t;
+
+typedef struct {
+    requirementkind_t kind;
+    int id;
+    int level;
+} requirement_t;
+
+/* One requirement of a catalog product, on top of its building prerequisites. */
+typedef struct {
+    int product; /* catalog ui_id */
+    requirement_t req;
+} productreq_t;
+
+/* Roles of one actor type (index = actor type id). */
+typedef struct {
+    uint32_t roles;  /* AiRole mask. AI_ROLE_SUPPORT here only counts for non-fighters. */
+    uint32_t not_roles; /* AiRole bits the actor must not get (an interceptor is no fighter). */
+    int extra_hp;    /* Shields and the like, added to the actor's hit points. */
+} actorrole_t;
+
+/* A map's stat overrides, decoded to table/row/field/value entries that the
+ * game's patch_apply understands. The checked-in tables remain the
+ * authority: a level load resets them and lays the patch over them. */
+typedef struct {
+    uint16_t table, row, field;
+    int32_t value;
+} rulepatch_t;
+
+#define RULEPATCH_MAX 4096
+typedef struct {
+    rulepatch_t entries[RULEPATCH_MAX];
+    int count;
+} rulepatchset_t;
+
+typedef struct ruleset_s {
+    const char *game;
+    rulepolicy_t policy; /* Engine behaviour a game picks instead of adding a flag. */
+    const faction_t *factions;
+    int faction_count;
+    /* Faction index of an owner, or -1 while it cannot be told yet. */
+    int (*faction_of)(const level_t *map, int owner);
+    /* Optional: variant of the owner's faction (index into its variants),
+     * negative for none. */
+    int (*variant_of)(const level_t *map, int owner);
+    const actorrole_t *actors;
+    int actor_count;
+    const productreq_t *requirements;
+    int requirement_count;
+    /* Level of an upgrade (REQ_UPGRADE) an owner holds. */
+    int (*upgrade_level)(int owner, int upgrade);
+    /* Optional: a catalog's prerequisite ids name a product (a building or
+     * an upgrade). The product an id names; NULL: the product that makes
+     * the actor of that type. */
+    const StaticProductDefinition *(*prerequisite_product)(int id);
+    /* Optional: whether an owner meets a prerequisite id (a keep stands in
+     * for the town hall, an upgraded base for its lower tier, an upgrade
+     * reaches its level). NULL: a finished actor of the named product. */
+    bool (*prerequisite_met)(int owner, int id);
+    /* Optional: catalog ui_id of the research that raises `upgrade` to `level`
+     * for REQ_UPGRADE. NULL: the first upgrade product of that product_type. */
+    int (*upgrade_product)(int upgrade, int level);
+    /* Optional: what a catalog product costs per resource (index = resource).
+     * NULL: product->cost and extra_costs. Warcraft II prices lumber and oil
+     * from its stat tables, so a map's patch reaches the price. */
+    void (*product_costs)(const StaticProductDefinition *product, int *out);
+    /* Tech level (REQ_TECH) a producer has reached; negative while it cannot
+     * produce yet (still under construction). */
+    int (*tech_level)(const mobj_t *producer);
+    /* Starts, or keeps waiting for, the research that raises `producer` to its
+     * next tech level. True when research is under way. */
+    bool (*research)(level_t *map, mobj_t *producer);
+    /* Map stat overrides. patch_apply lays one decoded entry over the game's
+     * (writable) tables with R_PatchSet; patch_done runs after the last one
+     * to refresh whatever is derived from them. */
+    bool (*patch_apply)(const rulepatch_t *entry);
+    void (*patch_done)(void);
+} ruleset_t;
+
+extern const ruleset_t g_ruleset;
+/* g_ruleset, or a test's replacement (R_RulesOverride(NULL) restores it). The
+ * engine reads the ruleset through R_Rules(). */
+const ruleset_t *R_Rules(void);
+void R_RulesOverride(const ruleset_t *rules);
+/* The ruleset's input, sight and turning modes. */
+const rulepolicy_t *R_Policy(void);
+/* The patch of the loaded level. A game's G_DoLoadLevel decodes it here. */
+extern rulepatchset_t g_rulepatch;
+
+bool R_PatchAdd(rulepatchset_t *set, int table, int row, int field, int32_t value);
+/* Writes a ruleset value (an int in a game's stat table); the checked-in
+ * value comes back at the next R_PatchApply. False when the undo log is full. */
+bool R_PatchSet(int *slot, int value);
+/* Restores every table to its checked-in values, then lays `set` over them
+ * (NULL: restore only) and keeps it as g_rulepatch. */
+void R_PatchApply(const rulepatchset_t *set);
+/* Folds the active patch into a consistency hash. */
+uint32_t R_PatchHash(uint32_t hash);
+
+/* Plan of `faction` at `level`: opening goals and the doctrine. */
+bool R_FactionPlan(const faction_t *faction, int level, AiPlan *out);
+/* R_FactionPlan of the owner's faction with its variant applied. */
+bool R_OwnerPlan(const level_t *map, int owner, int level, AiPlan *out);
+/* Expands a faction's start units around a start location. Returns the
+ * number written (up to max). */
+int R_StartPlacements(const faction_t *faction, ivec2_t anchor, startplace_t *out, int max);
+/* g_ruleset's faction for `owner` (NULL while unknown). */
+const faction_t *R_OwnerFaction(const level_t *map, int owner);
+/* Requirements of a catalog product: its building prerequisites plus the
+ * ruleset's rows. Returns the number written (up to max). */
+int R_ProductRequirements(const StaticProductDefinition *product, requirement_t *out, int max);
+bool R_RequirementMet(int owner, const StaticProductDefinition *product, const requirement_t *req);
+/* Whether every building and upgrade row the ruleset adds to `product` is met
+ * (REQ_TECH rows concern the producer: see R_ProducerLackingTech). */
+bool R_RowsMet(int owner, const StaticProductDefinition *product);
+/* An owned producer of `product` that stands short of one of its REQ_TECH
+ * requirements and could be researched up, or NULL. */
+mobj_t *R_ProducerLackingTech(int owner, const StaticProductDefinition *product);
+
+/* Tech-path planner. From the requirement vectors the engine works out what an
+ * owner must still get, in the order to get it, before it can buy `target`:
+ * every unmet prerequisite building, upgrade and tech level, recursively, and
+ * a producer to make each of them. Steps come out in dependency order: the
+ * first one needs nothing the owner lacks. */
+typedef struct {
+    requirement_t req;  /* what is missing */
+    int product;        /* catalog ui_id that provides it; 0 for REQ_TECH */
+    int wanted_by;      /* catalog ui_id of the product that needed it */
+    bool pending;       /* already under way: queued, or still under construction */
+} techstep_t;
+enum { TECH_PATH_MAX = 32 };
+/* Steps to `target` (a catalog product), up to max. 0: nothing is missing (or
+ * not by tech: credits, queue). -1: no way to reach it from what the owner
+ * has and the catalog offers. */
+int R_TechPath(int owner, const StaticProductDefinition *target, techstep_t *out, int max);
+/* The first unmet step. False when R_TechPath finds none. */
+bool R_TechNextStep(int owner, const StaticProductDefinition *target, techstep_t *step);
+/* Whether the owner meets a catalog prerequisite id (see prerequisite_met). */
+bool R_PrerequisiteMet(int owner, int id);
+/* The catalog product a prerequisite id names, or NULL. */
+const StaticProductDefinition *R_PrerequisiteProduct(int owner, int id);
+
+/* The ruleset's products: the one description of what a product costs, how
+ * long it takes and who makes it, read by the AI and the HUD. The catalog
+ * (StaticProductDefinition) is the storage; nothing is copied. */
+typedef struct {
+    const StaticProductDefinition *def;
+    int ui_id;
+    RtsProductClass kind;
+    int cost[RTS_MAX_RESOURCES];
+    int time_ms;
+    const int *producers;     /* actor types that make it */
+    int producer_count;
+    const int *prerequisites; /* the catalog's prerequisite ids */
+    int prerequisite_count;
+} product_t;
+int R_ProductCount(int owner);
+bool R_ProductAt(int owner, int index, product_t *out);
+bool R_ProductByUiId(int ui_id, product_t *out);
+void R_ProductCosts(const StaticProductDefinition *product, int *out /* RTS_MAX_RESOURCES */);
+bool R_CanAfford(int owner, const StaticProductDefinition *product);
+
+typedef struct AiGameInterface {
+    const char *name;
+    uint32_t features; /* AiFeature mask the game enables. */
+    int think_interval_tics; /* Zero uses AI_THINK_INTERVAL_TICKS. */
+    /* AiLevel of an owner; AI_LEVEL_NONE owners are skipped entirely. */
+    int  (*player_level)(const level_t *map, int owner);
+    /* Optional override of the owner's goal ladder. NULL builds it from
+     * g_ruleset.factions[g_ruleset.faction_of(owner)] (R_FactionPlan). */
+    bool (*plan)(const level_t *map, int owner, int level, AiPlan *out);
+    /* The next three are optional; NULL selects the catalog implementation
+     * (G_AiCatalogOwned / the requirement-vector can_purchase / G_AiCatalogPurchase).
+     * A game keeps one only for what the catalog cannot say. */
+    int  (*owned)(int owner, int product);  /* alive plus queued */
+    int  (*can_purchase)(const level_t *map, int owner, int product);
+    bool (*purchase)(level_t *map, int owner, int product);
+    /* Optional override. Called for a NEED_TECH goal when RESEARCH is enabled;
+     * starts whatever tech-up unlocks `product`. Returning true makes the AI
+     * wait for it (like saving credits) instead of spending on lower goals.
+     * NULL walks the tech generically: a producer lacking the product's tech
+     * is handed to g_ruleset.research. */
+    bool (*develop)(level_t *map, int owner, int product);
+    /* Resource drop-off ("base") units that harvesters return to. Optional;
+     * the default is MF_RESOURCE_BASE. */
+    bool (*is_base)(const mobj_t *unit);
+    /* Structures that anchor defense and are the targets of attack waves.
+     * Optional; the default is is_base. Games whose drop-offs are a small
+     * subset of their buildings (Dark Reign, KKnD) widen it to all structures. */
+    bool (*is_anchor)(const mobj_t *unit);
+    /* Optional. Units a game's own jobs occupy (Warcraft builders on their
+     * way to a site): the economy, defense and attack waves leave them alone. */
+    bool (*is_busy)(const mobj_t *unit);
+    /* Optional. Gives an idle harvester its job and returns whether an order
+     * went out. The default sends it to the nearest free, reachable vent;
+     * games with several resources balance their workers here. */
+    bool (*assign_harvester)(level_t *map, int owner, mobj_t *unit);
+    /* Optional. The actor type a product makes, 0 for research; the doctrine
+     * reads roster roles from it. NULL uses G_AiCatalogActor. */
+    int  (*product_actor)(int product);
+    /* Optional. Adjusts a live unit's info after the catalog's, wherever the
+     * doctrine weighs an actual unit: a caster's energy, a loaded Bunker. */
+    void (*describe_unit)(const mobj_t *unit, AiUnitInfo *info);
+    /* Optional. Supply in use and the cap including supply already being
+     * made; false when the cap cannot grow further. Enables supply_buffer. */
+    bool (*supply)(int owner, int *used, int *cap);
+    /* Optional. The next purchase that takes a roster product further: what
+     * unlocks it while it cannot be bought, else its unit's next upgrade;
+     * 0 when nothing is left or it is already on the way. Enables research. */
+    int  (*advance)(const level_t *map, int owner, int product);
+    /* Optional. Sends a wave the engine assembled at `goal` itself, e.g.
+     * ships to the coast and soldiers onto transports; false lets the
+     * engine march it. */
+    bool (*dispatch)(level_t *map, int owner, mobj_t *const *wave, int count, mobj_t *goal);
+    /* Optional. Orders the engine cannot give, once per think after the
+     * waves: spells in battle, transports ferrying a wave, sieging, loading
+     * Bunkers, refilling hangars. */
+    void (*tactics)(level_t *map, int owner, mobj_t *const *units, int unit_count);
+    /* Optional. Founds a town: a town hall at the free resource site nearest
+     * the base. Returns an AiBuyStatus, BLOCKED when no site is free or a
+     * town is already on its way. Enables expand_workers. */
+    int  (*expand)(level_t *map, int owner);
+    /* Optional. The map's start locations, where enemy bases may stand;
+     * fills up to cap and returns the count. Enables the doctrine's scout. */
+    int  (*starts)(const level_t *map, fixed2_t *out, int cap);
+} AiGameInterface;
+
+typedef enum {
+    AI_EVENT_NONE = 0,
+    AI_EVENT_HARVEST_ASSIGNED, /* value = vent index */
+    AI_EVENT_PURCHASE,         /* value = product id */
+    AI_EVENT_DEFENSE_RALLY,    /* value = defenders sent */
+    AI_EVENT_WAVE_LAUNCHED,    /* value = units sent */
+    AI_EVENT_RESEARCH,         /* value = product id that needed the tech */
+    AI_EVENT_RETREAT,          /* value = units pulled back */
+    AI_EVENT_EXPAND,           /* value = towns before the new one */
+    AI_EVENT_SCOUT,            /* value = mobj id of the scout sent */
+} AiEventType;
+
+typedef struct {
+    AiEventType type;
+    int owner;
+    int time_ms; /* AI clock: accumulated tick time */
+    int value;
+} AiEvent;
+
+typedef struct {
+    int harvest_orders;
+    int purchases;
+    int defense_rallies;
+    int research_orders;
+    int upgrades;   /* purchases made by the doctrine's research need */
+    int waves;
+    int wave_units; /* total units sent in waves */
+    int retreats;
+    int holds;      /* thinks a ready wave waited for a stronger army */
+    int expansions; /* town halls ordered at new resource sites */
+    int scouts;     /* scouts sent to the start locations */
+    int thinks;
+} AiStats;
+
+typedef struct {
+    int vent_index;
+    int slug_unit_index;
+} AiHarvestAssignment;
+
+typedef struct {
+    fixed2_t base_position;
+    bool has_base;
+    int combat_unit_count;
+    int harvester_count;
+    AiHarvestAssignment harvest_assignments[AI_MAX_HARVEST_ASSIGNMENTS];
+    int harvest_assignment_count;
+    int attack_wave_timer_ms;
+    int attack_wave_size;
+    bool attack_wave_active;
+    uint8_t allegiance;
+    int level;          /* AiLevel; legacy mode uses AI_LEVEL_NORMAL */
+    AiPlan plan;
+    bool plan_loaded;
+    AiStats stats;
+    int towns;              /* Drop-off clusters: what workers and defenses scale by. */
+    /* Scouting memory: the strongest enemy field army seen, decaying while
+     * out of sight, what share of it flies or shoots air, and how recently
+     * something cloaked was seen. */
+    int enemy_strength;
+    int enemy_air_pct;
+    int enemy_antiair_pct;
+    int enemy_cloak_ms;
+    int supply_wait_ms;     /* Supply just ordered; wait before ordering more. */
+    uint32_t wave[AI_MAX_WAVE_TRACK]; /* mobj ids of the wave in the field */
+    int wave_count;
+    uint32_t scout;         /* mobj id of the scout on its way, 0 for none */
+    uint32_t starts_seen;   /* Start locations scouted, by starts() index. */
+    int found_ms;           /* AI clock when an enemy base was first seen; 0 before. */
+    struct { int product, until_ms; } refused[AI_MAX_REFUSED];
+} AiTeamState;
+
+typedef struct AiContext {
+    AiTeamState teams[AI_MAX_TEAMS];
+    bool initialized;
+    const AiGameInterface *game; /* NULL keeps the legacy generic behavior. */
+    uint32_t features;           /* Active mask; defaults to the game's. */
+    int clock_ms;
+    int think_counter;
+    AiEvent events[AI_EVENT_LOG_SIZE]; /* Ring; oldest entries are overwritten. */
+    int event_head;
+    int event_count;
+    int events_dropped;
+} AiContext;
+
+/* Saved games, as in Doom: the menu sets g_savefile (or g_loadfile and the
+ * map to load first) and the driver saves or restores between tics. A game
+ * with state beyond the level and its mobjs defines the three hooks. */
+typedef struct { char name[33], map[1024]; } saveinfo_t;
+extern char g_savefile[1200], g_loadfile[1200], g_savename[33];
+/* Save/load entry points the driver calls; default to G_SaveGame/G_LoadGame. */
+bool G_GameSave(const char *path, const char *name, const app_t *app,
+                const AiContext *ai, const hudtext_t *hud);
+bool G_GameLoad(const char *path, app_t *app, AiContext *ai, hudtext_t *hud);
+bool G_SaveInfo(const char *path, saveinfo_t *info);
+bool G_SaveGame(const char *path, const char *name, const app_t *app, const AiContext *ai,
+                const hudtext_t *hud);
+bool G_LoadGame(const char *path, app_t *app, AiContext *ai, hudtext_t *hud);
+/* The same save as one malloc'd memory image (caller frees), for the network
+ * resync. These work in a net game; the file versions refuse. */
+bool G_SaveGameBlob(void **data, size_t *length, const char *name, const app_t *app,
+                    const AiContext *ai, const hudtext_t *hud);
+bool G_LoadGameBlob(const void *data, size_t length, app_t *app, AiContext *ai, hudtext_t *hud);
+/* Network resync: save, and load while keeping this player's camera, HUD
+ * messages and selection. The driver installs these with D_SetNetResync. */
+bool G_ResyncSave(void **data, size_t *length, const app_t *app,
+                  const AiContext *ai, const hudtext_t *hud);
+bool G_ResyncLoad(const void *data, size_t length, app_t *app, AiContext *ai, hudtext_t *hud);
+size_t G_SaveExtraSize(void);
+void G_SaveExtra(void *out);
+bool G_LoadExtra(const void *data, size_t size);
+
+/* Appends a goal to a plan (ignored when full). */
+void P_AiPlanAdd(AiPlan *plan, int product, int count);
+/* Default AiGameInterface.player_level: every non-human owner is a NORMAL
+ * computer player. */
+int  P_AiLevelNonHuman(const level_t *map, int owner);
+
+void P_AiInit(AiContext *ctx);
+/* Attaches a game's interface and adopts its feature mask (NULL detaches). */
+void P_AiAttachGame(AiContext *ctx, const AiGameInterface *game);
+/* Runtime toggles, e.g. for a difficulty menu or tests. */
+void P_AiSetFeatures(AiContext *ctx, uint32_t features);
+void P_AiTick(AiContext *ctx, level_t *map, mobj_t *const *units, int unit_count,
+              const gameinfo_t *game_info, int dt_ms);
+
+/* The attached game's owned / can_purchase / product_actor, else the catalog's. */
+int  P_AiOwned(const AiContext *ctx, int owner, int product);
+int  P_AiProductActor(const AiContext *ctx, int product);
+int  P_AiCanPurchase(const AiContext *ctx, level_t *map, int owner, int product);
+
+/* The planner's view of an actor type: engine-derived roles and strengths
+ * adjusted by g_ruleset.actors. */
+void P_AiUnitInfo(const AiContext *ctx, uint16_t type_id, AiUnitInfo *out);
+
+/* Pops the oldest retained AI event. Returns false when the log is empty. */
+bool P_AiPollEvent(AiContext *ctx, AiEvent *out);
+const AiStats *P_AiStats(const AiContext *ctx, int owner);
+
+
+enum {
+    HARVEST_PHASE_NONE = 0,
+    HARVEST_PHASE_TO_MINE = 1,
+    HARVEST_PHASE_MINING = 2,
+    HARVEST_PHASE_TO_BASE = 3,
+    HARVEST_PHASE_TURNING = 4,
+    HARVEST_PHASE_UNLOAD_TURNING = 5,
+    HARVEST_PHASE_UNLOADING = 6,
+};
+
+bool P_HarvesterDocked(const mobj_t *unit);
+/* A harvester without a dock animation working its vent from the attachment
+ * point. Miners share the vent: nothing shoves them, and nothing routes or
+ * steers around them. */
+bool P_HarvesterSharingVent(const mobj_t *unit);
+bool P_HarvesterWorksOutside(const mobj_t *unit, const resourcevent_t *vent);
+/* Scales a harvested credit amount by the owner's 8.8 income_scale. */
+int P_ScaleIncome(const level_t *map, int owner, int amount);
+
+void debug_effects_log(const char *fmt, ...);
+
+fixed_t P_MobjRadius(const mobj_t *unit); /* Cells, 16.16. */
+
+static inline isize2_t P_ResourceVentFootprint(const resourcevent_t *vent) {
+    int w = vent && vent->footprint.w > 0 ? vent->footprint.w : 1;
+    int h = vent && vent->footprint.h > 0 ? vent->footprint.h : 1;
+    return (isize2_t){ w, h };
+}
+
+static inline bool P_ResourceVentContainsCell(const resourcevent_t *vent, ivec2_t cell) {
+    if (!vent) return false;
+    isize2_t fp = P_ResourceVentFootprint(vent);
+    return cell.x >= vent->cell.x && cell.x < vent->cell.x + fp.w &&
+           cell.y >= vent->cell.y && cell.y < vent->cell.y + fp.h;
+}
+
+static inline fixed_t P_ResourceVentRadius(const resourcevent_t *vent) {
+    isize2_t fp = P_ResourceVentFootprint(vent);
+    fixed_t hx = fp.w * (FIXED_ONE / 2), hy = fp.h * (FIXED_ONE / 2);
+    fixed_t r = fixed_hypot32(hx, hy);
+    return r > FIXED_LIT(1.45) ? r : FIXED_LIT(1.45);
+}
+bool P_CheckPosition(const level_t *map, const mobj_t *unit, fixed2_t at);
+bool P_TryMove(mobj_t *unit, fixed3_t position);
+void P_ClampToLevel(const level_t *map, mobj_t *unit);
+bool P_MapCircleWalkable(const level_t *map, int move_class, fixed2_t at,
+                         fixed_t radius, const fixed2_t *from);
+static inline int P_MobjMoveClass(const mobj_t *unit) {
+    return unit && unit->info ? unit->info->move_class : 0;
+}
+/* Cells occupied by idle ground units other than `exclude` (and, when order_id is
+ * not zero, other than members of that order). The planner treats them as costly,
+ * not solid. Returns NULL when there are none. Free with free(). */
+uint8_t *P_IdleBlockers(const level_t *map, const mobj_t *exclude, uint32_t order_id);
+void P_NavBeginTick(void);
+void P_NavRunPlans(const level_t *map);
+
+/* p_steer.c: shared path following, avoidance and overlap resolution. */
+bool P_SteerTarget(const level_t *map, mobj_t *unit, fixed2_t *target, bool *final);
+fixed2_t P_SteerAvoid(const mobj_t *unit, fixed2_t direction, fixed_t step);
+bool P_SteerProgress(const level_t *map, mobj_t *unit, bool moved);
+bool P_ReplanUnit(const level_t *map, mobj_t *unit);
+void P_SeparateUnits(const level_t *map);
+void P_MoveUnitsAt(const level_t *map, mobj_t *const *units, int count, fixed2_t goal);
+bool P_HarvestUnitsAt(const level_t *map, mobj_t *const *units, int count, fixed2_t goal);
+/* Return cargo to destination, or the nearest usable depot when NULL. */
+bool P_ReturnHarvest(level_t *map, mobj_t *unit, mobj_t *destination);
+
+void P_MoveOrderAt(const level_t *map, mobj_t *const *units, int unit_count,
+                         fixed2_t goal_position);
+bool P_MoveUnitTo(const level_t *map, mobj_t *unit, fixed2_t goal_position);
+bool P_HarvestOrderAt(const level_t *map, mobj_t *const *units, int unit_count,
+                             fixed2_t position);
+bool P_HarvestUnitTo(const level_t *map, mobj_t *unit, fixed2_t position);
+
+
+/* A screen is a table of items. The game fills the table with locations,
+ * pictures, text and routines; the engine hit-tests, keeps focus, edits
+ * text, waits for map targets and draws. */
+typedef enum {
+    MI_STATIC, /* a picture, text or ownerdraw that takes no input */
+    MI_BUTTON, MI_CHECK, MI_TEXTFIELD, MI_LIST, MI_SCROLLBAR, MI_DROPDOWN, MI_SLIDER,
+    MI_MINIMAP /* the level in small: a click or drag centres the world view there */
+} menuitemkind_t;
+
+/* How an item looks in one state. */
+typedef enum { MS_NORMAL, MS_FOCUS, MS_PUSHED, MS_DISABLED, MS_STATES } menustate_t;
+typedef struct {
+    int cell;     /* of the item's sheet; negative draws no picture */
+    irect_t part; /* a rectangle of that cell; empty means all of it */
+    int palette;  /* palette map of the sheet and of the font, or -1 */
+    const bitmapfont_t *font; /* text in this state; NULL uses the item's font */
+    uint32_t ink; /* text colour in this state; 0 uses the item's ink */
+    ivec2_t shift; /* text offset in this state, such as a pressed button's */
+} menulook_t;
+
+/* Where text sits in its rect. A zero width or height centres on that edge. */
+enum {
+    MALIGN_LEFT = 0, MALIGN_HCENTER = 1, MALIGN_RIGHT = 2,
+    MALIGN_VCENTER = 4, MALIGN_BOTTOM = 8,
+    MALIGN_CENTER = MALIGN_HCENTER | MALIGN_VCENTER
+};
+
+/* On a screen larger than menu->size a rect keeps its top-left place, or
+ * follows the right or bottom edge, or grows by the extra height/width. */
+enum { MANCHOR_RIGHT = 1, MANCHOR_BOTTOM = 2, MANCHOR_GROW = 4, MANCHOR_WIDE = 8 };
+
+/* MA_ACTIVATE: clicked, its hotkey pressed, or Enter while focused or
+ * edited; a check box has already changed. MA_SECONDARY: clicked with the
+ * right button. MA_CHANGE: the text of a field or the selected row of a list
+ * changed. MA_WHEEL: the wheel turned by menu->wheel over a HUD item.
+ * MA_TARGET: the left button went down on the world at menu->cursor while
+ * the item waited for a target. MA_CANCEL: its target or edit was abandoned
+ * with the right button or Escape. */
+typedef enum {
+    MA_ACTIVATE, MA_SECONDARY, MA_CHANGE, MA_WHEEL, MA_TARGET, MA_CANCEL
+} menuaction_t;
+
+/* An item can step through frames first..last. A loop wraps; a one-off stops
+ * on its last frame. The game draws the frame, or uses it as it likes. */
+typedef enum { MANIM_STOPPED, MANIM_LOOP, MANIM_ONCE } menuanimmode_t;
+typedef struct {
+    menuanimmode_t mode;
+    int first, last, frame;
+    int delay; /* ticks left on this frame */
+} menuanim_t;
+
+typedef void (*menuroutine_t)(menu_t *menu, menuitem_t *item, menuaction_t action);
+/* Draws the item into rect, its place on the screen. */
+typedef void (*menudraw_t)(const menu_t *menu, const menuitem_t *item, irect_t rect);
+
+struct menuitem_s {
+    bool passthrough; /* Decorative artwork does not consume world input. */
+    menuitemkind_t kind;
+    int id;       /* the game's name for it, such as a native control ID */
+    irect_t rect; /* in the menu's coordinates; see anchor */
+    irect_t hitbox; /* Optional input area relative to rect; artwork keeps rect. */
+    int anchor;
+    bool visible, enabled;
+    SDL_Keycode hotkey; /* activates the item while it is enabled */
+    bool quiet;   /* activates without the click sound */
+    bool release; /* a button: pressed shows on the way down, activates when the
+                   * mouse button or key comes up over it */
+    /* The picture is drawn at the rect origin plus the cell's displacement. */
+    const spritesheet_t *sheet;
+    menulook_t look[MS_STATES];
+    bool opaque; /* the sheet has no colour key: write its index 0 */
+    bool stretch; /* scale the source picture to the item's rectangle */
+    bool disabled_look; /* use authored MS_DISABLED art; otherwise keep MS_NORMAL */
+    bool layer;   /* a popup: it draws over every earlier item, text included */
+    int light;   /* 1..15 darkens the picture, in sixteenths; 0 is full light */
+    const bitmapfont_t *font;
+    uint32_t ink; /* 0xAARRGGBB text colour; 0 draws through the palette map */
+    uint32_t hotkey_ink; /* the hotkey's first letter in the text; 0 leaves it */
+    int mark_at, mark_len; /* with mark_len > 0, this span of the text takes hotkey_ink instead */
+    char text[128];
+    /* Long text wrapped in the rect, in the font's own colours. A list shows
+     * it while it has no rows. */
+    const char *prose;
+    int align;
+    ivec2_t inset; /* text origin inside the rect */
+    int maxchars;
+    int value; /* check: set; list: selected row, or -1 */
+    struct { int min, max; } range; /* horizontal slider's inclusive limits */
+    int group; /* check: nonzero makes it one of a set where exactly one is set */
+    /* A list asks for its rows; first_row is the scroll position, in rows for
+     * a list and in lines for prose. */
+    int rows, first_row, row_height;
+    const char *(*row)(const menuitem_t *item, int row);
+    /* A scroll bar shows and drags the list at index link. A button with a
+     * step scrolls the list or prose at index link by that much. */
+    int link, step;
+    /* Native scrollbar knob and dropdown arrow, from the item's sheet.
+     * A thumb with a nonempty part uses that fixed size instead of a fill. */
+    menulook_t thumb, arrow[MS_STATES];
+    int popup_rows; /* dropdown: maximum visible choices; zero shows all */
+    uint32_t fill;   /* 0xAARRGGBB behind the item; 0 draws none */
+    uint32_t border; /* 0xAARRGGBB outline around the item; 0 draws none */
+    struct { uint32_t outer, inner; } frame; /* Two rims outside the picture rect. */
+    uint32_t color;  /* list selection, scroll bar or plain button focus outline */
+    const char *tooltip; /* shown while the pointer rests on the item */
+    menuanim_t anim;
+    menuroutine_t routine;
+    menudraw_t ownerdraw; /* native content drawn after the standard picture */
+    /* While targeting the world: draw in framebuffer pixels, clipped to the
+     * world viewport (rect). Hidden while the cursor is over the HUD. */
+    menudraw_t drawtarget;
+    unsigned flags; /* the game's own, such as a native dialog record's; the engine ignores them */
+    const void *userdata;
+};
+
+struct menu_s {
+    menuitem_t *items;
+    int numitems;
+    /* A modal screen takes every event and has keyboard focus. Any other is a
+     * HUD: it takes hotkeys and the mouse events that land on a visible item,
+     * and its focus is the live item under the pointer. */
+    bool modal;
+    isize2_t size;    /* the screen the rects were laid out for; 0 is any */
+    bool stretch;     /* rects scale with the screen instead of anchoring */
+    bool fit;         /* integer-scale and centre the entire native size */
+    int itemOn;       /* focused item, or -1 */
+    menuitem_t *held; /* pressed by the mouse */
+    bool over;        /* the pointer is still on held */
+    menuitem_t *keyheld;   /* a release button pressed by keycode */
+    SDL_Keycode keycode;
+    menuitem_t *target;  /* waiting for a click on the world */
+    struct { uint32_t builder; int product; } placement;
+    menuitem_t *editing; /* a HUD text field that has the keyboard */
+    menuitem_t *dropdown; /* open choices, drawn and hit-tested above the screen */
+    int dropdown_row; /* pending choice; Escape leaves value untouched */
+    ivec2_t cursor;   /* the pointer, in screen pixels */
+    int wheel;        /* for MA_WHEEL */
+    SDL_Keymod keymod; /* modifiers of the key that activated an item */
+    app_t *app;       /* set by the engine before any routine runs */
+    const spritesheet_t *background;
+    const uint32_t *palette; /* screen palette while the menu draws; NULL keeps the level's */
+    void (*escape)(menu_t *menu);
+    /* Brings the items up to date with the game; runs before the menu takes
+     * an event or draws. */
+    void (*refresh)(menu_t *menu);
+    /* Runs once per front-end frame or HUD tic instead of M_MenuTicker. */
+    void (*ticker)(menu_t *menu);
+    /* Draws the tooltip of the item under the pointer; NULL shows none. */
+    void (*drawtip)(const menu_t *menu, const menuitem_t *item);
+    /* Ticks an animated item spends on its current frame; NULL means one. */
+    int (*frametics)(const menuitem_t *item);
+    /* Draws a visible item entirely, as the game's own executable does, in
+     * drawing pixels; false leaves it to the engine. An open dropdown's
+     * choices come as an MI_LIST copy of it whose value is the pending row. */
+    bool (*drawitem)(const menu_t *menu, const menuitem_t *item, menustate_t state, irect_t rect);
+    bool lifted;      /* the button that went down on a target is still down */
+    void *owner;
+    int click_sfx;    /* sfx an activation plays; 0 is the game's UI_SOUND_CLICK */
+};
+
+/* Returns whether the screen took the event. */
+bool M_MenuResponder(menu_t *menu, app_t *app, const SDL_Event *event);
+/* Advance every visible, running animation by one tick. */
+void M_MenuTicker(menu_t *menu);
+/* Restart an item's animation from its first frame. */
+void M_MenuAnimate(menuitem_t *item, menuanimmode_t mode);
+/* Set a list's row count and keep its scroll position inside it. */
+void M_MenuSetRows(menuitem_t *list, int rows);
+void M_MenuDrawer(menu_t *menu);
+/* The item's picture for that state, as the engine draws it. */
+void M_MenuDrawPicture(const menuitem_t *item, menustate_t state, irect_t rect);
+/* The item with this id, or NULL. */
+menuitem_t *M_MenuFind(const menu_t *menu, int id);
+/* Framebuffer pixels for input; logical drawing pixels inside M_MenuDrawer. */
+irect_t M_MenuItemRect(const menu_t *menu, const menuitem_t *item);
+/* The live item under the pointer, or the focus of a modal screen. */
+menuitem_t *M_MenuHover(const menu_t *menu);
+/* The item whose tooltip the cursor asks for: the hovered one, else a greyed
+ * one that explains itself (a StarCraft command's "Requires ..."). */
+menuitem_t *M_MenuTipItem(const menu_t *menu);
+/* The item's next left click on the world comes back as MA_TARGET; NULL
+ * stops waiting. The routine calls it again to take more points. */
+void M_MenuTarget(menu_t *menu, menuitem_t *item);
+/* Give a HUD text field the keyboard until Enter (MA_ACTIVATE) or Escape
+ * (MA_CANCEL); NULL takes it back. */
+void M_MenuEdit(menu_t *menu, menuitem_t *item);
+/* Centre the world view on a level cell. */
+void M_CentreView(app_t *app, fvec2_t cell);
+
+/* The front end. Escape opens the game's control panel; the engine routes
+ * input to the open screen, ticks it and draws it. */
+extern bool menuactive;
+extern bool menuerror;
+extern const char *menumap;
+/* Set by a menu inside a level: release the level and show the main menu. */
+extern bool menuleave;
+/* The open screen came up over a running level. */
+extern bool menuinlevel;
+extern menu_t *currentmenu;
+
+bool M_Init(app_t *app, const char *root);
+void M_StartControlPanel(app_t *app);
+/* Show this screen; the front end opens if it was closed. */
+void M_SetupNextMenu(menu_t *menu);
+/* Close the front end. */
+void M_ClearMenus(void);
+/* Dismissible message over the active control panel; owns a copy of the text. */
+void M_StartMessage(const char *text);
+void M_StopMessage(void);
+bool M_Responder(app_t *app, const SDL_Event *event, bool inlevel);
+/* After releasing the failed level, reset networking and show the main menu. */
+void D_NetGameError(app_t *app);
+/* In a level: Escape first cancels what the HUD waits for, then opens the
+ * control panel; an open screen takes everything. */
+bool D_MenuResponder(app_t *app, const SDL_Event *event, menu_t *hud);
+void M_Drawer(const app_t *app);
+void M_Ticker(void);
+void M_Shutdown(void);
+
+/* Multiplayer lives in the engine (hud/m_net.c). A game supplies a screen
+ * and, when it uses the shared screens, the maps and labels. The engine owns
+ * browse, join, host, chat, seat sync and the start rule: with races, every
+ * joined player presses Start; without races, the host starts once the roster
+ * is full.
+ *
+ * The published setup is 56 bytes: eight seats (race, type, color, team),
+ * sixteen host-owned option bytes, then eight ready flags. A joiner's choice
+ * is five bytes: those four seat fields and its ready flag. The host copies
+ * in only the fields named by joiner_fields, and always takes the ready flag. */
+enum { NET_FIELD_RACE = 1, NET_FIELD_TYPE = 2, NET_FIELD_COLOR = 4, NET_FIELD_TEAM = 8 };
+typedef struct {
+    uint8_t race, type, color, team;
+    bool ready;
+} netseat_t;
+typedef struct {
+    int max_players;   /* 2..MAXPLAYERS; 0 means 4 */
+    int race_count;    /* 0 hides races; otherwise 2..8 */
+    int joiner_fields; /* NET_FIELD_* a joiner may change on its own seat */
+    void (*commit)(void); /* level is about to start; M_NetPlayerRace is valid */
+    const char *(*chat_name)(void); /* NULL uses Host / Player N */
+} netplay_t;
+void M_NetUse(const netplay_t *play);
+const netseat_t *M_NetSeat(int player);
+/* Host: replace a seat and publish. Joiner: change its own allowed fields.
+ * Ready changes through M_NetToggleReady. Before a session, this only stores. */
+bool M_NetSetSeat(int player, const netseat_t *seat);
+void M_NetSetOptions(const void *data, size_t size); /* host-owned, 16 bytes */
+size_t M_NetOptions(void *data, size_t capacity);
+void M_NetCycleRace(int player);
+void M_NetToggleReady(void);
+bool M_NetChat(const char *text);
+const char *M_NetLog(void);
+const char *M_NetNotice(void);
+bool M_NetHosting(void);
+bool M_NetInLobby(void);
+int M_NetLocalSlot(void);
+bool M_NetHost(const char *title, const char *path, int players);
+/* Host: open or close seats in the lobby; joined players keep theirs. */
+bool M_NetSetPlayers(int players);
+bool M_NetJoinAddress(const char *address);
+bool M_NetBrowse(void);
+bool M_NetJoinListed(int index);
+void M_NetStop(void);
+/* -1 failed, 0 waiting, 1 launched (menumap set, commit called). */
+int M_NetPoll(void);
+const char *M_NetLaunchMap(void);
+typedef struct {
+    const spritesheet_t *background;
+    const uint32_t *palette; /* screen palette with the background; NULL keeps the menu's default */
+    const bitmapfont_t *font;
+    const spritesheet_t *panel; /* centred behind the screens' controls; NULL draws a plain box */
+    /* Styles a button or label the module just placed: its rect and text are
+     * set. NULL leaves the engine's plain look. */
+    void (*style_button)(menuitem_t *item);
+    void (*style_label)(menuitem_t *item);
+    /* Restyles a list and the scroll bar beside it, both placed already. */
+    void (*style_list)(menuitem_t *list, menuitem_t *bar);
+    /* The game draws the screens' items itself; see menu_t.drawitem. */
+    bool (*drawitem)(const menu_t *menu, const menuitem_t *item, menustate_t state, irect_t rect);
+    void (*back)(app_t *app); /* Previous Menu from the first screen */
+    int (*map_count)(void);
+    const char *(*map_path)(int index);  /* relative to the data root, as menumap is */
+    const char *(*map_title)(int index);
+    int max_players; /* 2..MAXPLAYERS; 0 means 4 */
+    const char *text[16]; /* NETTEXT_* labels; NULL entries keep the English default */
+    /* 0 opens create/join. 1 opens the host page and 2 the session browser;
+     * Escape from that page is Previous Menu. Later pages still fall back
+     * to create/join. */
+    int first;
+    /* 0 hides per-player race. 2..8 is how many races race_name can name. */
+    int race_count;
+    const char *(*race_name)(int index);
+    /* Person slots on a map. The host's player count cannot exceed it.
+     * NULL leaves the count under max_players only. */
+    int (*map_players)(int index);
+    /* Map's own race for a lobby seat (0..race_count-1), or -1. */
+    int (*slot_race)(int map_index, int player);
+    /* Called as the lobby launches, after M_NetPlayerRace is valid. */
+    void (*commit)(void);
+} netui_t;
+enum {
+    NETTEXT_TITLE, NETTEXT_CREATE, NETTEXT_JOIN, NETTEXT_PREVIOUS, NETTEXT_START, NETTEXT_CANCEL,
+    NETTEXT_SCENARIO, NETTEXT_PLAYERS, NETTEXT_REFRESH, NETTEXT_ADDRESS, NETTEXT_CONNECT,
+    NETTEXT_SESSIONS, NETTEXT_READY, NETTEXT_UNREADY, NETTEXT_YOU, NETTEXT_OPEN, NETTEXT_COUNT
+};
+void M_NetOpen(app_t *app, const netui_t *ui);
+/* Race a seat chose in the lobby that just launched, or -1. */
+int M_NetPlayerRace(int player);
+/* Menu routine for a plain Multiplayer button of a fallback front end. */
+void M_MenuMultiplayer(menu_t *menu, menuitem_t *item, menuaction_t action);
+
+/* The engine fallback front end of games without a native one. */
+void M_MenuBeginLevel(menu_t *menu, menuitem_t *item, menuaction_t action);
+void M_MenuQuitGame(menu_t *menu, menuitem_t *item, menuaction_t action);
+menu_t *M_SimpleControlPanel(menu_t *menu);
+
+/* What the HUD shows. The driver sets it before the HUD takes an event,
+ * ticks or draws. Its pointers are borrowed, so G_ShutdownHUD clears it
+ * before their owners free them. */
+typedef struct {
+    mobj_t *const *units;
+    int unit_count;
+    const spritecache_t *sprites;
+    const hudtext_t *messages;
+    const tileset_t *tileset; /* Borrowed native terrain for minimap drawing. */
+} hudview_t;
+extern hudview_t hudview;
+
+/* The HUD of games without a native one; their tables place these. */
+void HU_DrawCounter(const menu_t *menu, const menuitem_t *item, irect_t rect); /* resource item->value */
+void HU_DrawClock(const menu_t *menu, const menuitem_t *item, irect_t rect);   /* level time */
+/* A selected producer's products: units queue immediately; buildings target a site. */
+void HU_ProductList(menu_t *menu, menuitem_t *item, menuaction_t action);
+void HU_DrawPlacement(const menu_t *menu, uint16_t type, const mobj_t *builder);
+void HU_BuildProduct(menu_t *menu, menuitem_t *item, mobj_t *producer,
+                     const StaticProductDefinition *product);
+void HU_PlaceProduct(menu_t *menu, menuitem_t *item, menuaction_t action);
+void HU_DrawProductPlacement(const menu_t *menu, const menuitem_t *item, irect_t rect);
+void HU_DrawProducts(const menu_t *menu, const menuitem_t *item, irect_t rect);
+/* The next page of the product list at item->link. */
+void HU_ProductPage(menu_t *menu, menuitem_t *item, menuaction_t action);
+void HU_DrawProductPage(const menu_t *menu, const menuitem_t *item, irect_t rect);
+/* Keeps the product lists of a menu in step with the selection. */
+void HU_RefreshProducts(menu_t *menu);
+void HU_InitProducts(menu_t *menu, const char *root);
+
+/* A route being drawn on the map, and the routes kept for later. */
+enum { MAXSAVEDPATHS = 30 };
+typedef struct {
+    waypoints_t path;
+    waypoints_t saved[MAXSAVEDPATHS];
+    int saved_count;
+    int selection; /* saved route shown, or -1 */
+} pathbook_t;
+void HU_PathReset(pathbook_t *book);
+void HU_PathClear(pathbook_t *book);
+bool HU_PathDelete(pathbook_t *book);
+bool HU_PathSave(pathbook_t *book);
+void HU_PathSelect(pathbook_t *book, int saved); /* -1 deselects */
+/* Add a cell, or make an existing point current. */
+bool HU_PathPoint(pathbook_t *book, cell_t cell);
+/* Send the selected units along the route. */
+bool HU_PathGo(pathbook_t *book);
+bool HU_SelectedOrder(ticorder_t order, fvec2_t goal, uint32_t target);
+
+
+typedef struct app_s app_t;
+
+bool I_InitGraphics(app_t *app, int window_w, int window_h, bool hidden, bool software);
+void I_ShutdownGraphics(void);
+void I_GraphicsEvent(const SDL_Event *event);
+void I_FinishUpdate(void);
+bool I_SaveScreenshot(const char *path);
+void I_SetScaleMode(bool linear);
+
+
+typedef struct renderer_s renderer_t;
+
+typedef struct rendererbackend_s {
+    const char *id;
+    const char *name;
+    bool (*create)(renderer_t *renderer, const char *title, int width, int height,
+                   bool hidden, bool software);
+    void (*destroy)(renderer_t *renderer);
+    void (*begin_frame)(renderer_t *renderer, SDL_Color clear);
+    void (*end_frame)(renderer_t *renderer);
+    bool (*save_screenshot)(renderer_t *renderer, const char *path);
+} rendererbackend_t;
+
+struct renderer_s {
+    const rendererbackend_t *backend;
+    SDL_Window *window;
+    SDL_Renderer *sdl;
+    int width;
+    int height;
+};
+
+const rendererbackend_t *sdl_renderer_backend(void);
+const rendererbackend_t *renderer_backend_by_id(const char *id);
+
+bool renderer_create(renderer_t *renderer, const rendererbackend_t *backend,
+                         const char *title, int width, int height,
+                         bool hidden, bool software);
+void renderer_destroy(renderer_t *renderer);
+void renderer_begin_frame(renderer_t *renderer, SDL_Color clear);
+void renderer_end_frame(renderer_t *renderer);
+bool renderer_save_screenshot(renderer_t *renderer, const char *path);
+
+
+#endif

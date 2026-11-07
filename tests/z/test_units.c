@@ -1,0 +1,243 @@
+#include "t_local.h"
+#include "engine.h"
+#include "../../games/z/info.h"
+#include "../../games/z/z_local.h"
+
+#include <math.h>
+#include <stdio.h>
+
+static int fail(const char *msg) { return rts_fail("z", msg); }
+
+static int count(uint8_t team, int first_type, int last_type) {
+    int n = 0;
+    for (thinker_t *th = thinkercap.next; th != &thinkercap; th = th->next) {
+        const mobj_t *mo = (const mobj_t *)th;
+        if (mo->team == team && mo->type_id >= first_type && mo->type_id <= last_type && mo->hp > 0) n++;
+    }
+    return n;
+}
+
+static mobj_t *find(uint8_t team, int type) {
+    for (thinker_t *th = thinkercap.next; th != &thinkercap; th = th->next) {
+        mobj_t *mo = (mobj_t *)th;
+        if (mo->team == team && mo->type_id == type && mo->hp > 0) return mo;
+    }
+    return NULL;
+}
+
+static bool alive(const mobj_t *target) {
+    for (thinker_t *th = thinkercap.next; th != &thinkercap; th = th->next)
+        if ((const mobj_t *)th == target) return true;
+    return false;
+}
+
+static RtsGameModel *load_map(const char *map) {
+    RtsGameModel *model = rts_game_model_create();
+    RtsGameModelConfig config = { .data_root = "data/Z", .map_path = map };
+    if (model && rts_game_model_load(model, &config)) return model;
+    rts_game_model_destroy(model);
+    return NULL;
+}
+
+static RtsGameModel *load(void) { return load_map(NULL); }
+
+/* Level 1 starts both sides with LEVELS.DAT's groups 2, 2, 2 and 10: nine
+ * Grunts and a Gatling. The player's wait at the fort, the computer's
+ * stand where CPUPLR01.DAT puts them; four empty Jeeps wait on the roads. */
+static int test_level_units(void) {
+    RtsGameModel *model = load();
+    if (!model) return fail("load level 1");
+    if (count(0, MT_UNIT_GRUNT, MT_UNIT_GRUNT) != 9) return fail("player has nine Grunts");
+    if (count(0, MT_UNIT_GATLING, MT_UNIT_GATLING) != 1) return fail("player has a Gatling");
+    if (count(1, MT_UNIT_GRUNT, MT_UNIT_GRUNT) != 9) return fail("computer has nine Grunts");
+    if (count(1, MT_UNIT_GATLING, MT_UNIT_GATLING) != 1) return fail("computer has a Gatling");
+    mobj_t *jeep = find(4, MT_UNIT_JEEP);
+    if (count(4, MT_UNIT_JEEP, MT_UNIT_JEEP) != 4 || !jeep) return fail("four empty Jeeps");
+    if (jeep->traits & (MF_MOBILE | MF_ATTACK)) return fail("empty Jeeps are inert");
+    mobj_t *gun = find(0, MT_UNIT_GATLING);
+    if (!gun || gun->core.position.z <= 0 || (gun->traits & MF_MOBILE)) return fail("Gatling stands on the fort");
+    gun = find(1, MT_UNIT_GATLING);
+    if (!gun || gun->core.position.z <= 0) return fail("computer's Gatling stands on its fort");
+    puts("PASS: z level 1 loads both armies and the empty Jeeps");
+    rts_game_model_destroy(model);
+    return 0;
+}
+
+/* Select a player unit of `type` on `map`, order it four cells south and
+ * watch it walk there. */
+static int test_select_and_move(const char *map, int type, const char *label) {
+    RtsGameModel *model = load_map(map);
+    if (!model) return fail("load for move");
+    RtsRenderSnapshot snap;
+    if (!rts_game_model_snapshot(model, &snap)) return fail("snapshot");
+    int unit = -1;
+    for (int i = 0; i < snap.unit_count && unit < 0; ++i)
+        if (snap.units[i].owner == 0 && snap.units[i].type_id == type) unit = i;
+    if (unit < 0) return fail("find the unit to move");
+    fvec2_t start = snap.units[unit].position;
+    RtsGameCommand select = { .kind = RTS_GAME_COMMAND_SELECT_UNIT_INDEX,
+        .data.select_unit_index = { unit, false } };
+    if (!rts_game_model_command(model, &select)) return fail("select a Grunt");
+    RtsGameCommand move = { .kind = RTS_GAME_COMMAND_MOVE_SELECTED,
+        .data.move_selected = { .target = fixed2_from_fvec2((fvec2_t){start.x, start.y + 4.0f}) } };
+    if (!rts_game_model_command(model, &move)) return fail("order a move");
+    bool walked = false;
+    for (int t = 0; t < 90; ++t) {
+        if (!rts_tick(model, &snap)) return fail("tick");
+        walked |= states[snap.units[unit].state_id].group == 2;
+    }
+    if (fabsf(snap.units[unit].position.y - start.y) < 1.0f) return fail("unit moved");
+    if (!walked) return fail("unit played its walk");
+    printf("PASS: z %s selects, walks and moves\n", label);
+    rts_game_model_destroy(model);
+    return 0;
+}
+
+/* Two Grunts in range shoot until one falls, plays its death and goes. */
+static int test_fight_to_death(void) {
+    RtsGameModel *model = load();
+    if (!model) return fail("load for combat");
+    mobj_t *ours = find(0, MT_UNIT_GRUNT), *theirs = find(1, MT_UNIT_GRUNT);
+    if (!ours || !theirs) return fail("find both Grunts");
+    for (thinker_t *th = thinkercap.next; th != &thinkercap; th = th->next) {
+        mobj_t *mo = (mobj_t *)th;
+        if (mo != ours && mo != theirs && (mo->traits & MF_ATTACK)) mo->traits &= ~MF_ATTACK;
+    }
+    theirs->core.position = fixed3_add_planar(ours->core.position, (fixed3_t){FIXED_FROM_INT(3), 0, 0});
+    RtsRenderSnapshot snap;
+    mobj_t *dead = NULL;
+    bool fired = false;
+    for (int t = 0; t < 60 * RTS_TICRATE && !dead; ++t) {
+        if (!rts_tick(model, &snap)) return fail("tick");
+        fired |= states[ours->core.state_id].group == 3 || states[theirs->core.state_id].group == 3;
+        if (ours->hp <= 0) dead = ours;
+        else if (theirs->hp <= 0) dead = theirs;
+    }
+    if (!fired) return fail("Grunts fire");
+    if (!dead) return fail("one Grunt dies");
+    if (dead->core.state_id != S_GRUNT_DIE) return fail("dead Grunt falls");
+    for (int t = 0; t < 10 * RTS_TICRATE && alive(dead); ++t)
+        if (!rts_tick(model, &snap)) return fail("tick");
+    if (alive(dead)) return fail("dead Grunt is removed");
+    puts("PASS: z Grunts fire, die and leave");
+    rts_game_model_destroy(model);
+    return 0;
+}
+
+/* A Medium Tank facing north turns its turret, not its hull, to an enemy
+ * on its right, fires only once the turret is on it, and turns the
+ * turret back once the enemy is gone. */
+static int test_turret_aims(void) {
+    RtsGameModel *model = load_map("LEVEL09/LEVEL09.MAP");
+    if (!model) return fail("load for the turret");
+    mobj_t *tank = find(0, MT_UNIT_MED_TANK), *enemy = NULL;
+    for (thinker_t *th = thinkercap.next; th != &thinkercap && !enemy; th = th->next) {
+        mobj_t *mo = (mobj_t *)th;
+        if (th->function == P_MobjThinker && mo->team == 1 && mo->hp > 0 && Z_UnitType(mo) >= 0 &&
+            Z_IsRobot(Z_UnitType(mo)))
+            enemy = mo;
+    }
+    if (!tank || !enemy) return fail("a Medium Tank and an enemy robot");
+    /* The enemy stays where it is put; no computer player walks it off. */
+    P_AiSetFeatures(rts_game_model_ai(model), 0);
+    for (thinker_t *th = thinkercap.next; th != &thinkercap; th = th->next)
+        if ((mobj_t *)th != tank) ((mobj_t *)th)->traits &= ~MF_ATTACK;
+    angle_t north = P_PointToAngle(0, -FIXED_ONE), east = P_PointToAngle(FIXED_ONE, 0);
+    tank->core.angle = north;
+    enemy->core.position = fixed3_add_planar(tank->core.position, (fixed3_t){FIXED_FROM_INT(2), 0, 0});
+    enemy->hp = enemy->max_hp = 10000;
+    RtsRenderSnapshot snap;
+    int fired_at = -1;
+    for (int t = 0; t < 5 * RTS_TICRATE && fired_at < 0; ++t) {
+        if (!rts_tick(model, &snap)) return fail("tick");
+        if (states[tank->core.state_id].group == 3 || enemy->hp < enemy->max_hp) fired_at = t;
+    }
+    if (fired_at < 0) return fail("the tank fires");
+    if (fired_at < 3) return fail("the turret turns before the tank fires");
+    if (tank->core.angle != north) return fail("the hull keeps facing north");
+    if (angle_distance(tank->core.angle + tank->attack.aim, east) >= ANG45 / 8u)
+        return fail("the turret faces the enemy");
+    enemy->core.position = fixed3_add_planar(tank->core.position, (fixed3_t){FIXED_FROM_INT(40), 0, 0});
+    for (int t = 0; t < 2 * RTS_TICRATE; ++t)
+        if (!rts_tick(model, &snap)) return fail("tick");
+    if (tank->attack.aim != 0) return fail("the turret turns back to the hull");
+    puts("PASS: z Medium Tank aims its turret apart from its hull");
+    rts_game_model_destroy(model);
+    return 0;
+}
+
+/* Every vehicle composes eight directions of track frames, then of
+ * standing ones, and a wreck. */
+static int test_vehicle_sheets(void) {
+    static spritecache_t cache;
+    static const struct { const char *name; int frames; } vehicles[] = {
+        {"MED_TANK", 3 + 1}, {"HEAVY_TANK", 3 + 1}, {"LIGHT_TANK", 3 + 1}, {"APC", 3 + 1},
+        {"JEEP", 4 + 2}, {"CRANE", 3 + 1}, {"M_MISSILE", 3 + 1},
+    };
+    RtsGameModel *model = load();
+    if (!model) return fail("load for sheets");
+    if (!R_InitSprites("data/Z", &level, NULL, 0, &cache)) return fail("load sprites");
+    for (size_t v = 0; v < sizeof(vehicles) / sizeof(*vehicles); ++v) {
+        cachedsprite_t *entry = R_CacheFind(&cache, vehicles[v].name);
+        if (!entry) return fail("vehicle sheet loads");
+        const spritedef_t *def = &entry->sprite.spritedef;
+        if (def->numframes != vehicles[v].frames + 1) return fail("track frames and a wreck");
+        for (int f = 0; f < def->numframes; ++f) {
+            int turns = f < vehicles[v].frames ? 8 : 1;
+            if (def->spriteframes[f].rotations != turns) return fail("eight directions, one wreck");
+            for (int r = 0; r < turns; ++r)
+                if (!def->spriteframes[f].directions[r].layers) return fail("every direction drawn");
+        }
+    }
+    R_FreeSpriteCache(&cache);
+    puts("PASS: z vehicles compose eight directions and a wreck");
+    rts_game_model_destroy(model);
+    return 0;
+}
+
+static const weapondef_t mobjinfo_attack_dummy = {.damage = 10};
+/* Retail stats from ROBOTS.DAT (units.inc) and the bullet armour rule. */
+static int test_retail_stats(void) {
+    RtsGameModel *model = load();
+    if (!model) return fail("load for stats");
+    mobj_t *grunt = find(0, MT_UNIT_GRUNT), *gatling = find(0, MT_UNIT_GATLING);
+    if (!grunt || !gatling) return fail("level 1 Grunt and Gatling");
+    const mobjtype_t *g = grunt->info;
+    /* 30 hp, 5 a shot every 20 steps, 120 px, speed level 4: 1/2 px a step. */
+    if (g->max_hp != 30 || g->attack.damage != 5 || g->attack.cooldown_ms != 20 * 1000 / 70 ||
+        g->attack.range != FIXED_ONE * 120 / Z_TILE || g->speed != (fixed_t)((int64_t)FIXED_ONE * 70 / (2 * Z_TILE)))
+        return fail("Grunt has its ROBOTS.DAT statistics");
+    if (gatling->info->max_hp != 50 || gatling->info->attack.cooldown_ms != 3 * 1000 / 70)
+        return fail("Gatling has 25 * weapon +5 hit points and its fire rate");
+    /* A Grunt's bullet loses 5 against a gun and is left with 0 or 1. */
+    int hit = Z_HitDamage(grunt, &g->attack, gatling, 5, 1);
+    if (hit < 0 || hit > 1 || Z_HitDamage(grunt, &g->attack, find(1, MT_UNIT_GRUNT), 5, 1) != 5)
+        return fail("bullets lose 5 against vehicles and guns only");
+    /* A Sniper's bullets find a Jeep's driver (accuracy 120 of 128) and
+     * leave the Jeep standing empty. */
+    mobj_t *jeep = P_SpawnMobj(gatling->core.position, MT_UNIT_JEEP), *sniper = NULL;
+    for (thinker_t *th = thinkercap.next; th != &thinkercap && !sniper; th = th->next) {
+        mobj_t *mo = (mobj_t *)th;
+        if (th->function == P_MobjThinker && mo->z.robot && Z_IsRobot(Z_UnitType(mo))) sniper = mo;
+    }
+    if (!jeep || !sniper) return fail("driver fixture");
+    Z_SetTeam(jeep, 0);
+    jeep->z.driver = MT_UNIT_GRUNT - MT_UNITS + 1;
+    sniper->z.robot = 4 + 1; /* ROBOTS.DAT record 4, the Sniper: accuracy 120. */
+    sniper->type_id = MT_UNIT_SNIPER;
+    int body = 0;
+    for (int shot = 0; shot < 40 && jeep->z.driver; ++shot, ++leveltime)
+        body += Z_HitDamage(sniper, &mobjinfo_attack_dummy, jeep, 10, 1);
+    if (jeep->z.driver || !Z_Enterable(jeep) || body > 10 * 5)
+        return fail("bullets kill a Jeep's driver and leave it empty");
+    puts("PASS: z units carry their retail statistics, bullet armour and driver kills");
+    rts_game_model_destroy(model);
+    return 0;
+}
+
+int main(void) {
+    if (test_level_units() || test_select_and_move(NULL, MT_UNIT_GRUNT, "Grunt") ||
+        test_select_and_move("LEVEL09/LEVEL09.MAP", MT_UNIT_MED_TANK, "Medium Tank") ||
+        test_vehicle_sheets() || test_fight_to_death() || test_turret_aims() || test_retail_stats()) return 1;
+    return 0;
+}

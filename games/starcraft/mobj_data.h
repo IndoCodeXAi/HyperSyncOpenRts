@@ -1,0 +1,56 @@
+#ifndef __MOBJ_DATA__
+#define __MOBJ_DATA__
+/* Invincible units ignore damage. Hallucinations are excluded from triggers.
+ * attacker is the owner of the last hit, valid only when SC_HIT is set.
+ * SC_STARTED: shields and energy hold their spawn values.
+ * SC_LOADED: inside the Bunker that is its parent. SC_RETURNING: an
+ * interceptor flying home to its Carrier. SC_HOLD prevents pursuit.
+ * parent is what the mobj belongs to: a larva's hatchery, an add-on's
+ * building, an interceptor's Carrier, a scarab's Reaver, a loaded unit's
+ * Bunker or transport. A hatchery's larva_ms counts down to its next larva.
+ * SC_BURROWED: dug in (Burrow, or a Spider Mine waiting), hidden from
+ * whoever has no detector, and unable to move. */
+enum { SC_INVINCIBLE = 1, SC_HALLUCINATION = 2, SC_HIT = 4, SC_STARTED = 8, SC_LOADED = 16, SC_RETURNING = 32, SC_HOLD = 64,
+       SC_BURROWED = 128 };
+enum { SC_ORDER_NONE, SC_ORDER_CAST, SC_ORDER_BOARD, SC_ORDER_MERGE, SC_ORDER_NUKE, SC_ORDER_REPAIR,
+       SC_ORDER_FOLLOW, SC_ORDER_LIFT, SC_ORDER_LAND, SC_ORDER_MINE, SC_ORDER_BURROW, SC_ORDER_UNBURROW,
+       SC_ORDER_INFEST, SC_ORDER_UNLOAD, SC_ORDER_NYDUS };
+/* Spell timers count 24 Hz frames down to zero; Irradiate and Plague count
+ * the 8-frame beats on which they hurt. LIFE ends a timed unit or effect. */
+enum { SC_TIMER_LIFE, SC_TIMER_MATRIX, SC_TIMER_IRRADIATE, SC_TIMER_PLAGUE, SC_TIMER_ENSNARE,
+       SC_TIMER_LOCKDOWN, SC_TIMER_STORM, SC_TIMER_STIM, SC_TIMER_STASIS, SC_TIMERS };
+/* A transport's slots: eight one-slot passengers at most. */
+enum { SC_CARGO = 8 };
+/* A pending order a unit walks to carry out:
+ * a spell or archon merge on target or at a pixel, boarding a Bunker or
+ * transport, a nuclear strike being painted, repair, Follow, building
+ * flight, laying a Spider Mine, burrowing, infesting a Command Center,
+ * unloading at a spot or walking into a Nydus Canal. at holds pixels for
+ * spells, mines and unloading, placement cells for landing. time counts frames down
+ * (repair debit/Follow check), or marks landing descent. An effect
+ * area keeps its spell in tech. */
+typedef struct { int kind, tech; uint32_t target; ivec2_t at; int time; } sc_order_t;
+typedef struct { fixed2_t at; uint32_t target; bool set; } sc_rally_t;
+typedef struct { uint8_t active, phase; } sc_glow_t;
+/* Shields, energy and the Defensive Matrix are 1/256 points, as StarCraft
+ * keeps them; wound is the fraction of a hit point already lost. parasite
+ * holds the sight bits of the teams that see through this unit. hangar
+ * counts docked interceptors or scarabs, a silo's nuke or a Vulture's
+ * Spider Mines. A Nydus Canal's parent is its other end. */
+#define MOBJ_GAME_FIELDS struct { uint8_t flags, attacker, wound; uint16_t kills; int guard_hp, shields, energy; \
+    uint32_t parent; int larva_ms; int timers[SC_TIMERS], matrix, hangar; uint32_t parasite, addon, cargo[SC_CARGO]; \
+    sc_order_t order; sc_rally_t rally; sc_glow_t glow; } sc;
+#define MOBJ_GAME_CHECKSUM(HASH, mo) do { \
+    HASH((mo)->sc.flags); HASH((mo)->sc.attacker); HASH((mo)->sc.guard_hp); \
+    HASH((mo)->sc.wound); HASH((mo)->sc.kills); HASH((mo)->sc.shields); HASH((mo)->sc.energy); \
+    HASH((mo)->sc.parent); HASH((mo)->sc.larva_ms); \
+    for (int sc_i = 0; sc_i < SC_TIMERS; ++sc_i) HASH((mo)->sc.timers[sc_i]); \
+    HASH((mo)->sc.matrix); HASH((mo)->sc.hangar); HASH((mo)->sc.parasite); HASH((mo)->sc.addon); \
+    for (int sc_i = 0; sc_i < SC_CARGO; ++sc_i) HASH((mo)->sc.cargo[sc_i]); \
+    HASH((mo)->sc.order.kind); HASH((mo)->sc.order.tech); HASH((mo)->sc.order.target); \
+    HASH((mo)->sc.order.at.x); HASH((mo)->sc.order.at.y); HASH((mo)->sc.order.time); \
+    HASH((mo)->sc.rally.at.x); HASH((mo)->sc.rally.at.y); \
+    HASH((mo)->sc.rally.target); HASH((mo)->sc.rally.set); \
+    HASH((mo)->sc.glow.active); HASH((mo)->sc.glow.phase); \
+} while (0)
+#endif

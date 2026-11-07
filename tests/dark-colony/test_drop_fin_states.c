@@ -1,0 +1,278 @@
+#include "engine.h"
+#include "info.h"
+#include "dark-colony.h"
+#include "t_local.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
+
+static void clear(app_t *app) {
+    (void)app;
+    V_BeginFrame(0xff46505au);
+}
+
+/* Same requested glow as render/r_draw.c additive_table: not a native DC.EXE table. */
+static const uint8_t *additive_rows(const spritesheet_t *sprite, const uint8_t *team, int intensity) {
+    static struct {
+        const uint32_t *palette;
+        const uint8_t *team;
+        int intensity;
+        uint32_t screen_hash;
+        uint8_t table[65536];
+        bool used;
+    } cache[4];
+    if (intensity <= 0 || intensity > 16) intensity = 16;
+    uint32_t screen_hash = 2166136261u;
+    for (int i = 0; i < 256; ++i) {
+        screen_hash ^= vpalette[i];
+        screen_hash *= 16777619u;
+    }
+    for (int i = 0; i < 4; ++i)
+        if (cache[i].used && cache[i].palette == sprite->source_palette &&
+            cache[i].team == team && cache[i].intensity == intensity &&
+            cache[i].screen_hash == screen_hash)
+            return cache[i].table;
+    int slot = 0;
+    for (int i = 0; i < 4; ++i) if (!cache[i].used) { slot = i; break; }
+    int factor = (intensity * 255 + 8) / 16;
+    int cg = (factor * 236 + 127) / 255;
+    int cb = (factor * 72 + 127) / 255;
+    uint8_t *table = cache[slot].table;
+    for (int src = 0; src < 256; ++src) {
+        uint8_t mapped = team ? team[src] : (uint8_t)src;
+        uint32_t color = sprite->source_palette[mapped];
+        int sr = ((int)((color >> 16) & 255) * factor / 255) * 230 / 255;
+        int sg = ((int)((color >> 8) & 255) * cg / 255) * 230 / 255;
+        int sb = ((int)(color & 255) * cb / 255) * 230 / 255;
+        for (int dst = 0; dst < 256; ++dst) {
+            int r = sr + (int)((vpalette[dst] >> 16) & 255);
+            int g = sg + (int)((vpalette[dst] >> 8) & 255);
+            int b = sb + (int)(vpalette[dst] & 255);
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+            table[(src << 8) | dst] = V_NearestIndex(0xff000000u | ((uint32_t)r << 16) |
+                                                     ((uint32_t)g << 8) | (uint32_t)b);
+        }
+    }
+    cache[slot].palette = sprite->source_palette;
+    cache[slot].team = team;
+    cache[slot].intensity = intensity;
+    cache[slot].screen_hash = screen_hash;
+    cache[slot].used = true;
+    return table;
+}
+
+/* Draw decoded FIN commands directly as an independent pixel reference. */
+static void draw_native_parts(app_t *app, const level_t *map,
+                               const spritecache_t *cache, const spritelayer_t *parts, int team) {
+    float sx, sy;
+    R_MapPositionToScreen(app, map, fixed3_zero(), &sx, &sy);
+    for (const spritelayer_t *part = parts; part->sprite_name[0]; ++part) {
+        const spritesheet_t *sprite = R_CacheLookup(cache,
+            M_va("SPRITES/%s.SPR", M_Upper(M_va("%s", part->sprite_name))));
+        CHECK(sprite && part->lump < sprite->numlumps);
+        const spritecell_t *cell = &sprite->cells[part->lump];
+        irect_t src = cell->rect;
+        irect_t dst = { (int)sx + part->offset.x +
+            ((part->flags & RTS_FRAME_FLIP_X) ? 0 : cell->displacement.x),
+            (int)sy + part->offset.y - src.h, src.w, src.h };
+        if (part->layer == 1 || part->layer == 2)
+            R_RenderSpriteShadow(app, sprite, part->lump, dst, part->flags);
+        if (sprite->shadowmap && part->layer == 2) continue;
+        if (R_RenderIndexedBlend(app, sprite, part->lump, dst, part->flags, part->layer)) continue;
+        int intensity = part->intensity > 0 ? part->intensity : 16;
+        uint32_t flags = (part->flags & RTS_FRAME_FLIP_X) ? V_FLIP_X : 0;
+        if (part->layer == 3) {
+            /* Existing requested glow policy; the native formula is unknown. */
+            const uint8_t *team_map = R_PaletteMap(sprite, team);
+            const uint8_t *table = additive_rows(sprite, team_map, intensity);
+            V_DrawBlockTranslucent((ivec2_t){dst.x, dst.y}, sprite->lumps[part->lump].indices,
+                                   (isize2_t){src.w, src.h}, src.w, table, flags);
+            continue;
+        }
+        CHECK(R_DrawSprite(sprite, part->lump, team, &src, &dst, flags, intensity));
+    }
+}
+
+static void check_sequence(app_t *app, SDL_Surface *surface, spritecache_t *cache,
+                           const char *file, const char *label_name,
+                           int first_state, int exit_state, int team, bool ticks66) {
+    level_t map = {0};
+    dc_fin_t fin;
+    CHECK(DC_LoadFIN(M_va("data/DCOLONY/ANIMATE/%s.FIN", file), &fin));
+    const dc_fin_label_t *label = DC_FINLabel(&fin, label_name);
+    CHECK(label);
+    const spritesheet_t *sheet = R_StateSprite(cache, &game_info, states[first_state].sprite, NULL);
+    CHECK(sheet);
+    int start = SDL_SwapLE16(label->start), end = SDL_SwapLE16(label->end);
+    mobj_t unit = { .traits = MF_RENDERABLE, .team = team,
+        .movement.goal = {16, 16} };
+    gameinfo = &game_info;
+    /* Enter unloading with cargo, then suppress release for this pixel-only fixture. */
+    unit.drop.payload_count = 1;
+    CHECK(P_SetMobjState(&unit, first_state));
+    unit.drop.payload_count = 0;
+    size_t bytes = (size_t)surface->pitch * surface->h;
+    void *expected_pixels = malloc(bytes);
+    CHECK(expected_pixels);
+    int elapsed = 0, native = 0;
+    for (int f = start; f <= end; ++f) {
+        CHECK(unit.core.frame == sheet->numlumps + f);
+        spritedirection_t expected = {0};
+        CHECK(DC_FINFrame(&fin, f, &expected));
+        const spritelayer_t *actual = sheet->spritedef.spriteframes[unit.core.frame].directions[0].layers;
+        int p = 0;
+        for (; expected.layers[p].sprite_name[0]; ++p) {
+            const spritelayer_t *part = &expected.layers[p];
+            CHECK(!strcasecmp(actual[p].sprite_name, !strcasecmp(part->sprite_name, file) ? "." : part->sprite_name));
+            CHECK(actual[p].lump == part->lump && ivec2_equal(actual[p].offset, part->offset));
+            CHECK(actual[p].layer == part->layer && actual[p].flags == part->flags);
+            CHECK(actual[p].remap == part->remap && actual[p].intensity == part->intensity);
+        }
+        CHECK(!actual[p].sprite_name[0]);
+        clear(app);
+        draw_native_parts(app, &map, cache, expected.layers, team);
+        V_ReadPixels(surface->pixels, surface->pitch);
+        memcpy(expected_pixels, surface->pixels, bytes);
+        clear(app);
+        R_RenderPlayerView(app, &map, NULL, &(mobj_t *){&unit}, 1, NULL, cache, &game_info, 0);
+        V_ReadPixels(surface->pixels, surface->pitch);
+        CHECK(!memcmp(expected_pixels, surface->pixels, bytes));
+        if (f == (start + end) / 2)
+            CHECK(SDL_SaveBMP(surface, M_va("/private/tmp/%s.bmp", label_name)) == 0);
+        bool native_timer = ticks66 || first_state == S_BRRKPOD_BUILD_TRSC1;
+        int boundary;
+        if (first_state == S_DROP_UNLOAD1) {
+            /* DC.EXE 0x423544–0x42358f maps DROP raw 0 to two ticks. */
+            CHECK(expected.ticks == 0);
+            boundary = elapsed + 2;
+        } else {
+            int raw = expected.ticks ? expected.ticks : 15;
+            int delay = ((raw + 3) * (native_timer ? 15 : 19)) / 100;
+            if (native_timer) {
+                delay &= 255;
+                if (!delay) delay = 256;
+            }
+            native += delay;
+            boundary = native_timer ? (native * 66 * 30 + 500) / 1000 : (native * 30 + 9) / 19;
+        }
+        CHECK(unit.core.tics == boundary - elapsed);
+        int state = unit.core.state_id, state_frame = unit.core.state_frame;
+        for (int t = elapsed; t < boundary; ++t) {
+            CHECK(unit.core.state_id == state && unit.core.state_frame == state_frame);
+            P_TickMobjState(&unit);
+        }
+        elapsed = boundary;
+        free(expected.layers);
+    }
+    CHECK(unit.remove == (exit_state == S_NULL) && unit.core.state_id == exit_state);
+    fprintf(stderr, "%s: team=%d frames=%d tics=%d native layers/pixels match\n", label_name, team, end - start + 1, elapsed);
+    free(expected_pixels);
+    DC_FreeFIN(&fin);
+}
+
+int main(void) {
+    P_InitThinkers();
+    SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(0, 640, 480, 32, SDL_PIXELFORMAT_ARGB8888);
+    CHECK(surface);
+    V_AllocScreen(640, 480);
+    app_t app = { .win = {640, 480}, .cam = {320, 360} };
+    spritecache_t *cache = calloc(1, sizeof(*cache));
+    CHECK(cache && load_dark_colony_unit_sprites("data/DCOLONY", NULL, NULL, 0, cache));
+    /* No level is loaded, so install one palette before the first clear. */
+    const spritesheet_t *trooper = R_CacheLookup(cache, "SPRITES/TRSC.SPR");
+    CHECK(trooper);
+    I_SetPalette(trooper->source_palette);
+    /* Every persistent state, including damage effects, selects complete FIN
+     * frames. Zero-tic actions never present their placeholder frame. */
+    for (int i = 1; i < NUMSTATES; ++i) {
+        const state_t *state = &states[i];
+        const spritesheet_t *sheet = R_StateSprite(cache, &game_info, state->sprite, NULL);
+        CHECK(sheet && state->frame + P_StateFrames(state) <= sheet->spritedef.numframes);
+        for (int frame = 0; frame < P_StateFrames(state); ++frame)
+            if (P_StateTics(state, frame))
+                CHECK(state->frame + frame >= sheet->numlumps);
+    }
+    static const struct { const char *file, *label; int first, last; } sequences[] = {
+        {"HUBU", "TRSCBUILD0", S_BRRKPOD_BUILD_TRSC1, S_NULL},
+        {"BARR", "BARRDIE14", S_BARR_DIE1, S_BARR_CORPSE},
+        {"SARG", "SARGDIE14", S_SARG_DIE1, S_SARG_CORPSE},
+        {"ORTU", "ORTUDIE14", S_ORTU_DIE1, S_ORTU_CORPSE},
+        {"SLUG", "SLUGDIE14", S_SLUG_DIE1, S_SLUG_CORPSE},
+        {"SCGM", "SCGMDIE0", S_SCGM_DIE1, S_SCGM_CORPSE},
+        {"EXPL", "EXPLDIE0", S_EXPL_DIE1, S_EXPL_CORPSE},
+        {"EXPL", "EXPLDEPLOY14", S_EXPL_DEPLOY1, S_EXPL_WORK1},
+        {"SLUG", "SLUGDEPLOY14", S_SLUG_DEPLOY1, S_SLUG_WORK1},
+        /* Preserve the corrected mining cycle's authored frames. */
+        {"SLUG", "SLUGRETRACT14", S_SLUG_WORK1, S_SLUG_WORK1},
+        {"SLUG", "SLUGRETRACT14", S_SLUG_RETRACT1, S_NULL},
+        {"TURR", "TURRDIE0", S_TURR_DIE1, S_NULL},
+        {"TONG", "TONGDIE0", S_TONG_DIE1, S_NULL},
+        {"CENT", "CENTDIE0", S_CENT_DIE1, S_NULL},
+        {"TONG", "TONGSTAND0", S_TONG_STND1, S_TONG_STND1},
+        {"CENT", "CENTSTAND0", S_CENT_STND1, S_CENT_STND1},
+        {"HUBU", "EXCOPODSTAND0", S_EXCOPOD_STND, S_EXCOPOD_STND},
+        {"HUBU", "BRRKPODSTAND0", S_BRRKPOD_STND, S_BRRKPOD_STND},
+        {"ALBU", "MINDHIVSTAND0", S_ALIEN_MINDHIVE_STND, S_ALIEN_MINDHIVE_STND},
+        {"ALBU", "WARHIVESTAND0", S_ALIEN_WARHIVE_STND, S_ALIEN_WARHIVE_STND},
+        {"ALBU", "BRDRHIVSTAND0", S_ALIEN_BRDRHIVE_STND, S_ALIEN_BRDRHIVE_STND},
+        {"ALBU", "BRDRHIV2STAND0", S_ALIEN_BRDRHIVE2_STND, S_ALIEN_BRDRHIVE2_STND},
+        {"ALBU", "MNDHIV2STAND0", S_ALIEN_MINDHIVE2_STND, S_ALIEN_MINDHIVE2_STND},
+        {"ALBU", "MINDHIVSTAND0", S_ALIEN_MINDHIVE3_STND, S_ALIEN_MINDHIVE3_STND},
+    };
+    for (size_t i = 0; i < sizeof(sequences) / sizeof(sequences[0]); ++i)
+        check_sequence(&app, surface, cache, sequences[i].file, sequences[i].label,
+                       sequences[i].first, sequences[i].last, 0, false);
+    static const struct { const char *file, *label; int first, last; } weapons[] = {
+        {"ATRIL", "PUSBULLET0", S_PUS_BULLET1, S_PUS_BULLET1},
+        {"TURR", "TURRBULLET0", S_TURR_BULLET1, S_TURR_BULLET1},
+        {"XENO", "XENOBULLET0", S_XENO_BULLET1, S_XENO_BULLET1},
+        {"TURR", "SMOKEXPLODE0", S_ROCKET_SMOKE1, S_NULL},
+        {"NUKE", "NUKE", S_NUKE1, S_NULL},
+        {"SMAY", "SMAY", S_SMAY1, S_NULL},
+        {"SCGM", "SPIKEBULLET0", S_SPIKE_BULLET1, S_SPIKE_BULLET1},
+        {"GASY", "GASY", S_GASY1, S_NULL},
+    };
+    for (size_t i = 0; i < sizeof(weapons) / sizeof(weapons[0]); ++i)
+        check_sequence(&app, surface, cache, weapons[i].file, weapons[i].label,
+                       weapons[i].first, weapons[i].last, 0, true);
+    for (int team = 0; team < 8; ++team) {
+        check_sequence(&app, surface, cache, "DROP", "DROPMOVE0", S_DROP_MOVE1, S_DROP_MOVE1, team, false);
+        /* An empty cargo lets the release state advance without spawning units. */
+        check_sequence(&app, surface, cache, "DROP", "DROPTWO", S_DROP_UNLOAD1, S_DROP_MOVE1, team, false);
+    }
+    static const struct { int product, first, last; const char *file, *label; bool ticks66; } builds[] = {
+        {16, S_EXCOPOD_BUILD1, S_EXCOPOD_STND, "PART4", "EXCOPODBUILD0", false},
+        {17, S_BRRKPOD_BUILD1, S_BRRKPOD_STND, "PART4", "BRRKPODBUILD0", false},
+        {18, S_ROBOPOD_BUILD1, S_ROBOPOD_STND1, "ROBO", "ROBOPODBUILD0", false},
+        {22, S_RSCHPOD_BUILD1, S_RSCHPOD_STND1, "PART2", "RSCHPODBUILD0", false},
+        {20, S_SCNCPOD_BUILD1, S_SCNCPOD_STND1, "DROP", "SCNCPODBUILD0", false},
+        {21, S_SCNCPOD2_BUILD1, S_SCNCPOD2_STND1, "DROP3", "SCNCPOD2BUILD0", false},
+        {19, S_ROBOPOD2_BUILD1, S_ROBOPOD2_STND1, "DROP4", "ROBOPOD2BUILD0", false},
+        {28, S_BIOHIV_BUILD1, S_ALIEN_MINDHIVE_STND, "SAUC", "BIOHIVBUILD0", true},
+        {29, S_WARHIVE_BUILD1, S_ALIEN_WARHIVE_STND, "SAUC", "WARHIVEBUILD0", true},
+        {30, S_BRDRHIV_BUILD1, S_ALIEN_BRDRHIVE_STND, "SAUC2", "BRDRHIVBUILD0", true},
+        {31, S_BRDRHIV2_BUILD1, S_ALIEN_BRDRHIVE2_STND, "SAUC2", "BRDRHIV2BUILD0", true},
+        {32, S_MINDHIV_BUILD1, S_ALIEN_MINDHIVE2_STND, "SAUC2", "MINDHIVBUILD0", true},
+        {33, S_MNDHIV2_BUILD1, S_ALIEN_MINDHIVE3_STND, "SAUC2", "MNDHIV2BUILD0", true},
+        {34, S_RSCHIV_BUILD1, S_ALIEN_RSCHIVE_STND, "SAUC4", "RSCHIVBUILD0", true},
+    };
+    for (size_t i = 0; i < sizeof(builds) / sizeof(builds[0]); ++i) {
+        const StaticProductDefinition *product = G_ModelProductByClassType(NULL, RTS_PRODUCT_BUILDING, builds[i].product);
+        CHECK(product && G_ModelBuildingStateForProduct(&game_info, product) == builds[i].first);
+        check_sequence(&app, surface, cache, builds[i].file, builds[i].label,
+                       builds[i].first, builds[i].last, 7, builds[i].ticks66);
+    }
+    R_FreeSpriteCache(cache);
+    free(cache);
+    R_FreeSpriteBuffer();
+    V_FreeScreen();
+    SDL_FreeSurface(surface);
+    puts("PASS: FIN state coverage and complete death/deploy/building/dropship pixels and timing");
+    return 0;
+}

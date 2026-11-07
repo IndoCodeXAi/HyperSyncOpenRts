@@ -1,0 +1,1037 @@
+# open-rts architecture
+
+## Purpose
+
+open-rts is a small C engine for reproducing classic real-time strategy games. The
+engine owns the common loop, map primitives, actor state machine, movement,
+combat, rendering, and headless model API. Each game supplies its original-data
+loaders, actor definitions, animation tables, mission logic, UI definition, and
+asset conventions.
+
+The project follows the Doom/Heretic/Hexen family of designs: simulation objects
+advance from a single thinker-style tick, state actions run when states are
+entered, and presentation reads a snapshot of simulation state.
+
+## Layers
+
+```text
+driver/       application, SDL window, command-line selection, main loop
+interface/    SDL/video integration
+game/         shared game-model API and command/event bridge
+play/         simulation: actors, states, movement, pathfinding, combat
+render/       map, sprite, effect, and decoration rendering
+hud/          fonts, messages, and game UI presentation
+sound/        Doom-style s_sound.c (channels, listener) over an i_sound.c mixer
+games/<game>/ one game's loaders, data tables, ruleset, missions
+tests/        headless model, data-layout, and per-game command tests
+data/<game>/  original game assets and scenario files
+```
+
+Each game is its own binary. The engine is statically linked with exactly one
+`games/<id>/` directory, and `make` builds `build/bin/dark-colony`, `dark-reign`,
+`7legion`, `kknd`, `warcraft-2` and `starcraft` from the same shared sources. There
+is no `--game` flag, no dynamic loading and no registry of games. A game is
+the set of functions and tables the engine links against: `G_DoLoadLevel`,
+`P_LoadThings`, `gameinfo_t`, `g_ruleset`, and the weak hooks declared in
+`include/engine.h`. That keeps the reproduction path close to the original game
+and makes each game self-contained. Because the engine is compiled once per
+game, per-game build shape (level fields, queue length) comes from
+`games/<id>/game_config.h`.
+
+## How a game object is defined
+
+An object has three related definitions, plus the instance created at runtime.
+
+```text
+ActorType[]        gameplay/config values
+      +
+MobjInfo[]         original-style type/state entry points
+      +
+State[]            animation/action graph
+      |
+      +--> mobj_t   live simulation object
+```
+
+### `ActorType[]`: gameplay configuration
+
+Each game defines an `ActorType` table in its game implementation (the C
+type is `actortype_t`). A row is the authoritative runtime configuration for a
+type: numeric ID, name, base sprite/shadow, traits, speed, hit points, attack
+range/damage/cooldowns, death timing, harvester state, and effect names.
+
+These values are intentionally hardcoded C data, like Doom's `mobjinfo[]`, rather
+than read directly from an extracted binary table on every spawn. Extraction
+tools and original files establish the values; the checked-in table makes the
+simulation deterministic, reviewable, and independent of an optional asset
+probe. DC uses `games/dark-colony/g_game.c`; DR uses
+`games/dark-reign/g_game.c`.
+
+`traits` are capability flags, not animation states. For example,
+`MF_MOBILE | MF_ATTACK` makes an object eligible for movement and attack orders,
+while `MF_HARVESTER` enables resource behavior. A building can be renderable,
+selectable, and a producer without being mobile.
+
+### Trait flags (`MF_*`)
+
+The trait enum is `mobjflag_t` in `include/engine.h`. Older notes and commits call
+these flags `T_*` (`T_MOBILE`, etc.); the current names are `MF_*` following the
+Doom naming convention. Traits are a bitmask stored in both `actortype_t.traits`
+and the live `mobj_t.traits`. `P_ApplyActorTypeDefaults()` copies the authored
+mask to a spawned object, so add or remove capabilities in the game's
+`ActorType` table rather than in the renderer or command handler.
+
+| Flag | Capability and consumers |
+| --- | --- |
+| `MF_SELECTABLE` | The player may select the object; selection markers and selection-dependent UI require it. Death clears it. |
+| `MF_MOBILE` | The object participates in movement, pathfinding, and separation. Movement/harvest orders require it. Death clears it. |
+| `MF_RENDERABLE` | The renderer draws the object's body and current state frame. It normally remains set on a dead object while its death animation plays. |
+| `MF_ATTACK` | The object may receive attack orders and run attack behavior. Death clears it. |
+| `MF_HARVESTER` | The object may execute resource harvesting. A harvest order requires both `MF_MOBILE` and `MF_HARVESTER`; death clears it. |
+| `MF_DETECTOR` | Its sight also detects: cells it reveals carry its team in the low sight bits (`P_Detectors`). |
+| `MF_CLOAKED` | Enemies cannot see, target or auto-target it unless their (or allied) detectors cover its cell. Set by type data (Dark Colony mines, StarCraft Observer) or at runtime (StarCraft cloaking). |
+
+Use bitwise tests for individual capabilities and bitwise combinations for
+requirements:
+
+```c
+if ((unit->traits & MF_ATTACK) != 0) { /* can attack */ }
+if ((unit->traits & (MF_MOBILE | MF_HARVESTER)) ==
+        (MF_MOBILE | MF_HARVESTER)) { /* can harvest */ }
+unit->traits &= ~(MF_SELECTABLE | MF_MOBILE); /* remove capabilities */
+```
+
+Do not compare the complete mask when checking one capability: unrelated flags
+may be present. Traits do not describe producer status, animation groups, or
+death state; those come from product tables and `MobjInfo[]`/`State[]` data.
+The renderer-neutral snapshot exposes the same bit values as
+`RtsRenderTrait` in `game/g_game.h`.
+
+### `MobjInfo[]`: type entry points
+
+`mobjinfo_t` is defined in each game's `info.h`, following Doom's ownership
+of the object schema alongside its game tables. Shared `actor.h` only forward
+declares it; simulation code that reads its fields includes the selected game's
+`info.h`. The per-game build already selects that header through its include path.
+
+It provides the classic state entry points and physical defaults:
+spawn, see, missile/attack, pain, death, radius, height, mass, damage, and
+flags. The model resolves an actor's type ID through the selected game's
+`gameinfo_t` and applies the corresponding `ActorType` defaults before calling
+`P_SpawnMobj`.
+
+### `State[]`: animation and behavior graph
+
+`state_t` is a data-driven state node derived from Hexen's `INFO.H` layout, but
+one row is a *run* of consecutive sprite frames, as Quake II's `mmove_t`: it
+names a sprite, the first frame, the number of frames, their duration in
+simulation tics (one value, or a `TICS(...)` list where native timing is
+uneven), an optional action callback, the next state, and a gameplay group.
+The action executes on entering every frame of the run; the next state follows
+the last frame. Doom's one-frame state is a run of one. `mobjcore_t.state_frame`
+is the actor's position in the run, and `P_SetMobjStateFrame` enters a run at a
+given frame. Zero-tic frames chain immediately; nonzero frames remain active
+until their tic count expires. Read durations through `P_StateTics`, never
+`state->tics` directly. Directional frame arrays, overlay metadata, and
+opaque per-state userdata are not part of the current runtime model; direction
+selection and render flags are applied at the presentation boundary.
+
+World actions use the Hexen-style `void action(mobj_t *actor)` contract. During
+`P_SetMobjState`, the dispatcher temporarily exposes the active
+`statecontext_t`; an action can call `P_GetStateContext()` when it needs the
+active level, effect pool, or game tables. The action signature remains about
+the object receiving the state. Hexen's weapon psprite actions are a separate
+family because they operate on `player_t` and `pspdef_t`; that family is not
+used for ordinary world actors or Dark Colony dropships.
+
+This means “walking”, “attacking”, “dying”, “deploying”, and “building” are
+usually state chains rather than ad hoc renderer conditions. The model can detect
+important transitions, such as entering an attack group, without making the
+renderer responsible for gameplay.
+
+### Gameplay tables and FIN extraction
+
+Dark Colony's `games/dark-colony/info.c` and `info.h` own the authored sprite
+catalog, gameplay states, actions, and object definitions. They retain the
+previous generator's verified state timing and transitions.
+
+`make dark-colony-info` exports `build/dc-animations.txt` from `ANIMATE/*.FIN`.
+`tools/dc_info_conv` reads only FIN labels, frame indices, and raw
+frame durations. Its multigen-style rows use numeric FIN indices rather than
+Doom frame letters. Actions are `NULL` and sequence ends are `S_NULL` placeholders;
+this is an extraction artifact, not a replacement for gameplay tables.
+Every valid native label is kept without interpreting directions or layers;
+unlabeled frames are exported separately. Unsupported tables and invalid ranges
+are reported on stderr and in `; SKIPPED` comments, never repaired or clamped.
+
+### Dark Colony
+
+DC SPR files are palette-indexed sprite resources whose frame and animation
+meaning is coupled to DC's FIN/state data. FIN data supplies building
+footprints, pivots, offsets, and multi-part placement. The DC loader preserves
+bottom-up world coordinates and uses authored FIN offsets for building and
+Barracks release placement. Basic actor state rendering currently selects the
+authored sprite/frame directly; directional and overlay state expansion was
+removed until it is supported by verified native behavior.
+
+DC's `gameinfo_t` still owns game-specific coordinate and rendering policy, but
+the compact state rows do not carry a second per-facing or overlay state table.
+
+### Dark Reign
+
+DR sprite resources and scenario/map data use different naming, tile, facing, and
+placement conventions. DR actors commonly use 8-facing gameplay orientation,
+while some source data and visual tables expose 16-direction concepts that must
+be mapped to the game's direction codes. Buildings use separate body/base/tile
+visual pieces, and scenario placement is not interchangeable with DC placement.
+
+The DR loader resolves scenario unit/building declarations into actor types and
+visual specs, then the shared state/render path applies the DR `gameinfo_t`
+direction and coordinate policy. The renderer never guesses a DC layout for a DR
+sprite.
+
+### Coordinate and facing normalization
+
+The shared simulation stores world positions in game-cell coordinates. Native
+asset coordinates remain explicit at the boundary. Cell dimensions come from
+the game (`g_cell_w`, `g_cell_h`), while FIN-authored placement data is applied
+by the game loader or the relevant placement helper. Renderer conversion applies
+the selected coordinate policy exactly once.
+
+This is why a state can use a DC FIN top-left pivot while another state uses a
+ground offset, without flipping the whole map or applying a global correction.
+`play/p_facing.c`, `play/p_mobj.c`, and `render/r_draw.c` own the shared
+conversion helpers; game loaders own native-file interpretation.
+
+The simulation uses `facing_t`, a 16-bit compass angle (`0` = north, increasing
+clockwise, full circle = `65536`) for gameplay orientation. Keep gameplay facing
+canonical; convert to native direction codes only at a game-specific boundary.
+Do not store a game's sprite index as the actor's general facing.
+
+## Core data contracts
+
+### `level_t`: map data and ownership
+
+`level_t` is the shared map container. Its `width`/`height` define a row-major
+cell grid addressed through `L_Index(map, x, y)`; callers should use
+`L_Contains` before indexing. `tile_ids`, optional tile-overlay arrays,
+transform arrays, `blocked`, and `cell_colors` are parallel allocations indexed
+by that same grid. Tile transforms use the engine-defined
+`MAP_TILE_TRANSFORM_FLIP_X` and `MAP_TILE_TRANSFORM_FLIP_Y` bits. `blocked` is
+simulation/pathfinding data; tile IDs and overlays are presentation data, even
+though both originate in the game loader.
+
+Map rendering capabilities are selected per loaded map through
+`level_t.render_capabilities`, never through per-game compile flags. A loader
+enables only the behavior represented by its native data, such as cell-color
+fallbacks, terrain transitions, per-cell tile transforms, zero-valued empty
+tiles, or tile layers that must be depth-sorted with world objects. The engine
+owns traversal, culling, transforms, animation, and composition; game code owns
+native parsing and normalization into these shared arrays.
+
+The map also owns decorations, resource vents, map extras, player resources, and
+game-native loader data. It also owns the active game's opaque mission state
+through `mission` and `destroy_mission`. `G_DoLoadLevel()` attaches mission
+state; `G_MissionTicker()` resolves it from the level; and `P_FreeLevel()`
+releases it. `P_FreeLevel()` also invokes `destroy_native_data` when present. A
+game may attach parsed native state via `native_data`, but the shared engine
+must not inspect or free it directly. Each game binary compiles with its native
+Y-axis convention through `RTS_WORLD_Y_UP`.
+Source coordinates remain native; `L_ScreenY*`/`L_WorldYF` convert only at
+rendering and input boundaries.
+
+### `mobj_t` and `effect_t`: simulation objects
+
+`mobj_t` is a live actor and owns gameplay state, orders, timers, production
+state, and a fixed-capacity path. `effect_t` is a transient visual object: it
+shares the state/render core (fixed position, momentum, facing, state, frame,
+offsets, remap, and intensity) but adds active/lifetime policy instead of actor
+gameplay. `mobjcore_t.position` and `momentum` are `fixed3_t`: each axis is a
+signed 32-bit 16.16 value. Game-native formats such as Dark Colony's signed
+16-bit 8.8 object coordinates are converted at the loader boundary. Effects are
+stored in a bounded pool and may spawn a finishing decoration; they are not
+selectable, movable, attackable actors and should not be added to `mobj_t`.
+
+State transitions are the common bridge: `P_SetMobjState` and effect state entry
+apply the selected frame and action, while `P_Ticker` advances actors and
+`P_UpdateEffects` advances transient effects. Actor removal uses swap-compaction;
+effect slots are likewise reusable, so retain IDs or authored references rather
+than pointers or array positions across a tick.
+
+### `RtsGameModel`, commands, events, and snapshots
+
+`RtsGameModel` is opaque on purpose. `rts_game_model_*` exposes the simulation
+without SDL, textures, game-private structs, or direct mutable access. Feed it
+`RtsGameCommand` intent, advance it with `rts_game_model_tick`, consume transition
+notifications with `rts_game_model_poll_event`, and read presentation state with
+`rts_game_model_snapshot`.
+
+`RtsRenderSnapshot` is a value copy, not a live view: its unit/effect/decoration
+arrays and UI script are bounded buffers owned by the caller. Snapshot indexes
+are valid only for that snapshot; use `RtsRenderUnit.id` and event IDs to track
+actors across ticks. `RtsProductDefinition` describes UI/product rows and
+availability, not the internal `mobj_t` layout. This boundary is the intended
+integration point for headless tests and alternate frontends. The network layer
+(`driver/d_net.c`) sits underneath: with a session active, `rts_game_model_tick`
+pumps it and advances only when every player's commands have arrived.
+
+### Asset containers and lifetime
+
+`tileset_t` contains the decoded terrain atlas, tile lookup, and tile animation
+metadata. `spritesheet_t` contains the texture, frame rectangles, ground points,
+displacements, native sequences, and optional remap textures for one asset. A
+`spritecache_t` owns named `cachedsprite_t` entries for per-object and decoration
+assets; use `R_CacheLookup` rather than loading the same sheet ad hoc.
+
+These containers are renderer-owned resources and may contain SDL textures, so
+the model path must not create or require them. Loaders may keep format-specific
+parsing state in `native_data` with a matching destroy callback; call the
+corresponding `R_FreeTileset`, `R_FreeSprite`, `R_FreeSpriteCache`, or
+`HU_FreeFont` instead of freeing individual fields. `bitmapfont_t` is a
+specialized spritesheet plus glyph metrics, while `hudtext_t` is only a bounded
+TTL message queue.
+
+## Loading a game
+
+The interactive and model loaders follow the same conceptual sequence:
+
+1. Select the game implementation and establish its default root/map/sprite.
+2. Call `G_DoLoadLevel` for map geometry, dimensions, tiles, resources, and
+   game-specific map metadata.
+3. Call `P_LoadThings` to decode initial object declarations into `mobj_t` rows.
+4. Apply actor defaults and enter each object's spawn state with `P_SpawnMobj`.
+5. The game loader attaches optional mission/script state to `level_t`.
+6. Load tiles and the fallback sprite through `W_LoadAssets`.
+7. Resolve per-object and decoration sprite resources with `R_InitSprites`.
+8. Build the game's HUD table with `G_InitHUD`.
+
+The model path deliberately omits SDL asset textures but keeps the same map,
+actor, state, mission, production, movement, and event behavior. This is what
+makes scenario tests useful without a display.
+
+## Input and command translation
+
+SDL input is handled at the driver/game boundary. `G_Responder` interprets
+mouse/keyboard events against the current camera, map, selection rectangle, and
+UI layout. Screen coordinates are converted to world/grid coordinates by
+`R_ScreenToMapGrid` and related helpers. Selection and camera state live in
+`app_t`; simulation state remains in `mobj_t`/`RtsGameModel`.
+
+The interactive path then invokes gameplay operations such as `P_MoveOrder`,
+`P_HarvestOrderAt`, or UI product activation. The headless/API path expresses
+the same intent as `RtsGameCommand` values:
+
+```text
+SDL event -> G_Responder -> gameplay command/order -> simulation tick
+test/API  -> RtsGameCommand ----------------------^
+```
+
+Commands identify actors by stable ID where possible. Index fields are retained
+as compatibility fallbacks, but indexes can change after death/removal or
+production because the unit array uses swap-compaction.
+
+Input does not directly mutate rendering fields or fabricate completion events.
+The command changes simulation intent; the next tick updates movement, state,
+combat, mission logic, and production, which then produces snapshots and events.
+
+## Mission scripts and game-specific behavior
+
+Mission code is owned by the game directory. `G_DoLoadLevel()` parses the
+relevant scenario/script format and attaches the result to `level_t`.
+`G_MissionTicker()` advances scripted spawns/objectives using the active level,
+actor array, effect array, actor count, HUD, and elapsed time. `P_FreeLevel()`
+releases the level-owned mission. Mission code creates, removes, moves, or
+animates objects using the same runtime representation as ordinary gameplay.
+
+The driver and `RtsGameModel` do not own a second mission pointer. This mirrors
+Doom's level-global state model: the active level is the ownership boundary for
+map data and the script state that governs that map.
+
+Dark Colony dropships are stored as `mobj_t` entries inside the mission's bounded
+dropship array. Their runtime fields live on the object itself: position and
+flight endpoints, payload, phase timing, and effect slots. Dropship state actions
+use the normal mobj action ABI and obtain the active mission through
+`P_GetStateContext()` and `level_t`; no dedicated dropship back-pointer or
+required parallel Dropship wrapper is used.
+
+The shared model ticks the mission between core simulation phases and then
+reconciles stable IDs and transition state for event emission. This allows a
+scripted enemy wave or release animation to be observed by exactly the same test
+code as a player-issued order.
+
+## Runtime flow
+
+The interactive loop is:
+
+1. Parse the data paths and options (the game is whichever one the binary was linked with).
+2. Load the map/scenario through the game implementation.
+3. Load initial actors, map tiles, decorations, sprites, and optional mission
+   state.
+4. Read SDL input and translate it into game commands.
+5. Advance the deterministic simulation by fixed simulation time.
+6. Run mission scripts, production, effects, and HUD timers.
+7. Build the render plan and draw the map, decorations, actors, effects, and UI.
+
+The headless path uses the same model and simulation code without creating a
+window or renderer. `RtsGameModel` loads a scenario, accepts commands, advances
+ticks, exposes a renderer-neutral snapshot, and exposes simulation transition
+events for tests or another frontend.
+
+## Simulation objects
+
+`mobj_t` is the common actor representation. It contains:
+
+- stable identity (`id`), type, owner, health, and gameplay traits;
+- world position, movement goal, path, facing, and arrival state;
+- state-machine fields (`state_id`, `tics`, frame, render flags);
+- attack target, cooldown, animation/death state, and effect metadata;
+- production actor/product, queue, timers, and release state.
+
+Actors use `gameinfo_t`, `mobjinfo_t`, and `state_t` tables. `P_SetMobjState`
+enters a state's first frame, applies its visuals, runs its action callback, and
+follows zero-tic frames and next states immediately. `P_Ticker` is the central actor update. Dead actors are
+removed using swap-compaction, so callers must use stable actor IDs rather than
+array positions across ticks.
+
+Movement uses map-cell coordinates and pathfinding from `play/p_map.c`. Commands
+set goals; ticking advances actors along paths. The model reports `UNIT_ARRIVED`
+when an ordered actor reaches its goal.
+
+## Commands and events
+
+Commands are intent coming into the simulation. They are defined in
+`game/g_game.h` and currently include selection, movement, harvesting, UI button
+activation, attack, and product construction.
+
+Events are transitions coming out of the simulation. They are delivered through a
+bounded FIFO with `rts_game_model_poll_event`:
+
+| Event | Meaning |
+| --- | --- |
+| `UNIT_ARRIVED` | A movement order reached its goal. |
+| `BUILD_QUEUED` | A valid product order was accepted. |
+| `BUILD_STARTED` | Production timing began for a queued product. |
+| `UNIT_BUILT` | A unit actor was created and placed. |
+| `BUILDING_BUILT` | A building actor was created and placed. |
+| `BUILD_FINISHED` | Compatibility/general production completion event. |
+| `BUILD_BLOCKED` | Production could not release or continue; emitted once per blocked queue state. |
+| `ATTACK_STARTED` | An actor entered an attack state. |
+| `UNIT_DIED` | An actor crossed into death/removal. |
+
+Events carry the simulation tick, subject and target IDs/types, product class and
+type where relevant, and subject position. IDs are stable for the life of an
+actor; snapshot indexes are only current-frame lookup conveniences.
+
+This separation is intentional: commands are deterministic inputs, while events
+are observable consequences. It also matches the useful OpenRA distinction
+between orders/activities entering the simulation and notifications or state
+transitions coming out of it.
+
+## Production
+
+Product definitions are authored in each game as C tables. They describe
+the original UI ID, product row/type, cost, faction, prerequisites, and producer
+types. Runtime game data may be used to discover and verify values, but the
+authoritative gameplay balance and product mapping is the checked-in C table.
+
+The normal lifecycle is:
+
+```text
+command accepted
+      -> BUILD_QUEUED
+      -> BUILD_STARTED
+      -> training/release or placement
+      -> UNIT_BUILT / BUILDING_BUILT
+```
+
+Dark Colony units use producer queues and preserve the Barracks release animation
+and FIN-authored exit point. Dark Colony buildings currently use immediate
+placement after a valid producer/order. Dark Reign products use the production
+queue and construction-crew producer path.
+
+## Combat
+
+A type carries up to two weapons (`weapondef_t` in `include/engine.h`):
+`attack`, and `air_attack`, which replaces it against flyers when it has damage.
+`P_MobjWeapon` picks the weapon for a target, and range, damage, cooldown,
+targeting and the AI's strengths all follow it. Games with one weapon leave
+`air_attack` empty. A weapon can also hit several times per attack (`hits`),
+splash around its target (`splash`, `radius`: full, half and quarter damage
+in three rings; radial, enemy-only or air-only), and bounce (`bounces`, a
+third of the damage per jump, as the Mutalisk glaive does). Each hit goes
+through `gameinfo_t.hit_damage`, where a game applies its upgrades, armor,
+damage types and shields. A weapon's `min_range` leaves a dead zone it cannot
+reach. Three more hooks let a game shape combat without engine branches:
+`attack` makes an attack itself (StarCraft launches interceptors and
+scarabs), `range_bonus` adds reach (a Bunker, range upgrades) and
+`sight_teams` shares a mobj's sight with other teams (Parasite).
+
+Cloaking is one rule for every game: an `MF_CLOAKED` mobj is hidden from
+enemy teams unless an `MF_DETECTOR` of theirs covers its cell
+(`P_VisibleTo`, `P_VisibleToPlayer`). Dark Colony mines and StarCraft cloaks
+both use it; Warcraft II keeps its own invisibility. `gameinfo_t.mobj_ticker`
+runs a game's per-tic actor rules, such as StarCraft shields and energy.
+
+A type with a `turret` aims apart from its hull. The engine keeps the
+turret's facing in `attack.aim`, relative to the hull, and turns it
+`turret.turn_step` a tic toward a target in reach, or back to the hull when
+there is none. The unit fires once the turret is on target and leaves its
+hull where it was. The renderer draws the turret's own sheet by that aim, its
+ground point on the `mount` the hull picture carries (kept unmirrored; a
+mirrored hull mirrors it), in `turret.frame`, or while attacking in
+`turret.fire_frame` onward as the body goes through its attack run. Z's
+tanks, jeep, crane and mobile missile, StarCraft's turret subunits (Goliath
+and Siege Tank in both modes) and KKnD's 4x4 Pickup use it.
+
+## Computer players
+
+One shared AI (`play/p_ai.c`, `play/p_ai_doctrine.c`) runs every game. A game
+attaches an `AiGameInterface` that answers the questions only it can: who is a
+computer, how a worker is sent to gather, how a building is placed. What each
+faction is lives in the game's [ruleset](#ruleset), as data. Blizzard's AIs split
+the same way. StarCraft keeps per-race `aiscript.bin` build orders, and the
+engine works out each unit's strength from `units.dat` and `weapons.dat`.
+Warcraft III keeps per-race JASS files.
+
+- **Opening** (`faction_t.opening`, copied to `AiPlan.goals`): an ordered goal
+  ladder, like the `build`/`train` lines of an aiscript.
+- **Doctrine** (`faction_t.doctrine`, `AiPlan.doctrine`): numbers for what the
+  faction is good at. These are workers per town, the supply buffer, static
+  defenses per town, a weighted roster for the army mix, how far the mix bends
+  toward counters, and the strength ratios at which waves set out or fall back.
+  A faction may carry another doctrine per `AiLevel` (`level_doctrine`).
+- **Unit knowledge** (`P_AiUnitInfo`): roles and strengths. The engine derives
+  them from `mobjtype_t`: traits and the ground and air weapons with their
+  hits. Strength follows Brood War's `calculate_unit_strengths`, kept
+  separately against ground and air. `g_ruleset.actors` adds only what the
+  actor cannot show: supply, cloaking, casters and shields (and `not_roles`
+  for what a type must not count as, an interceptor's fighting);
+  `describe_unit()` adjusts a live unit (a caster's energy, a loaded Bunker, a
+  Carrier's hangar). `tactics()` uses a game's unit abilities once per think:
+  casting, siege mode, Bunkers, hangars. Units need no hand-written AI fields.
+
+Every think the engine scouts what the team can see, keeps a fading estimate of
+the enemy army and its air share, and notes when it first saw an enemy
+building (`found_ms`). Once the doctrine's `scout` product is bought, one
+scout (the fastest idle worker or unarmed flyer) walks to the start
+locations the game's `starts` hook names, nearest unseen first, and comes
+home to mine once it has seen an enemy base, so the estimate forms before
+the first fight. Then the team works through these steps in order:
+
+1. Order supply ahead of demand.
+2. Found a town once every town standing has `expand_workers` workers
+   (after `expand_after` stands, up to `max_towns`). A town is a cluster of
+   drop-offs with resources left by it; workers and static defenses scale
+   with towns, and a mined-out town no longer counts, so the team moves on.
+   The game's `expand` hook picks the site and buys the town hall: StarCraft
+   takes the free mineral fields nearest the base, places the hall at the
+   retail three-cell gap from fields and geysers, and sends workers only to
+   patches by its own town halls.
+3. Follow the opening.
+4. Serve the doctrine's needs: workers, detection after a cloaked sighting,
+   static defense (anti-air once air is seen), research, then the roster
+   entry furthest below its counter-weighted share. A defense without a
+   weapon (Warcraft's Watch Tower) is a site: standing sites are armed in
+   place before another is raised. Research buys what the game's `advance`
+   hook names for the most numerous roster units, one purchase per
+   `100 / research` fighters fielded.
+5. Launch a wave only when idle strength reaches `attack_ratio` percent of the
+   estimate. Idle support units (casters, healers) go along. A game's
+   `dispatch` hook may send the wave itself, splitting it by what can reach
+   the goal.
+6. Pull a wave home when it falls below `retreat_ratio` percent of the enemies
+   around it.
+7. Give the game's `tactics` hook a turn for orders the engine cannot give:
+   spells in battle, transports ferrying soldiers, siege mode, Bunkers and
+   hangars.
+
+Steps 1 and 3 run under `AI_FEATURE_DOCTRINE`, so a test or a game can ask for
+the ladder alone. Zero doctrine values switch a behavior off, so games without
+a doctrine keep the ladder and timer AI; only Dark Colony still does. Dark
+Reign, KKnD and 7th Legion have no supply, so their doctrines leave `supply`
+unset and bound the army with `army_cap`. StarCraft's openings follow the retail
+melee scripts (`TMCu`, `ZMCu`, `PMCu` in `aiscript.bin`) and live in its faction
+rows with the doctrines; its `advance` hook keeps each race's weapons, armor and
+shields climbing and names the building a level needs (Armory, Science
+Facility, Lair and Hive, Templar Archives, Fleet Beacon). `tests/starcraft/test_ai.c`
+decodes those scripts to check the openings, plays each StarCraft race for
+fourteen minutes (scouting, expansions, level-2 upgrades and every roster unit
+fielded) and a Zerg-against-Protoss game; `tests/faction_regression.h` plays
+every faction of Dark Reign, KKnD and 7th Legion, `tests/ai_doctrine_regression.h`
+checks their doctrines headless, and `tests/dark-colony/test_ai_factions.c`
+covers those of Dark Colony. `tests/warcraft-2/test_ai.c` covers Warcraft II:
+armed towers, Wargus ai-cast spells, the research ladder, the PUD's `AIPL`
+scripts (passive slots stay idle; sea and air scripts, or an island start,
+build fleets, ferry soldiers and send flyers).
+
+## Ruleset
+
+The idea is borrowed from Freeciv, whose `units.ruleset`, `buildings.ruleset`
+and `nations.ruleset` describe what a game is while the server, AI and client
+read the same description. Ours stays C: each `games/<id>/rules.c` defines one
+`const ruleset_t g_ruleset` with designated initializers, so the compiler
+checks it and there is no parser. The unit catalog (`StaticProductDefinition`:
+cost, producer, time, building prerequisites) and the unit stat tables stay in
+their own files; the ruleset holds the rest.
+
+| Field | What it is | Who reads it |
+| --- | --- | --- |
+| `policy` | `rulepolicy_t`: input, sight, turning, selection, F10 and stance modes. | `R_Policy()` in input, sight and turning code. |
+| `factions`, `faction_of`, `variant_of` | `faction_t`: name, `start_units`, opening ladder, wave sizes, doctrine, optional doctrine per `AiLevel`, optional `variants` (another opening and roster weights: Warcraft II's sea and air scripts). `faction_of(map, owner)` maps an owner to a faction, or -1 while it cannot be told yet; `variant_of` picks its variant. | `ai_ensure_plan` builds the plan with `R_OwnerPlan` (`R_FactionPlan` plus the variant); `AiGameInterface.plan` remains only as an override. A melee start spawns `R_StartPlacements`. |
+| `actors` | `actorrole_t` per actor type: `AiRole` mask, roles to withhold, extra hit points (shields). | `P_AiUnitInfo`. |
+| `requirements` | `productreq_t` rows: a `requirement_t` (`REQ_BUILDING`, `REQ_TECH`, `REQ_UPGRADE`) added to a catalog product, on top of its building prerequisites. | `R_ProductRequirements`, `R_RowsMet` (catalog availability), the tech-path planner. |
+| `prerequisite_product`, `prerequisite_met`, `upgrade_product` | How a game reads a catalog prerequisite id (Dark Colony names rows, Dark Reign product ids, Warcraft II tiers that stand in for lower ones) and which product raises an upgrade to a level. | The tech-path planner. |
+| `tech_level`, `research`, `upgrade_level` | How a game reads a producer's tech level, starts the research that raises it, and reads an upgrade. | Generic tech walk. |
+| `product_costs` | Price per resource where the catalog's `cost` and `extra_costs` do not say it (Warcraft II lumber and oil). | `R_ProductCosts`, `R_CanAfford`. |
+| `patch_apply`, `patch_done` | How a map's stat overrides land in the game's tables. | `R_PatchApply`. |
+
+The input, sight, turning, selection, F10 and stance enums (`rulepolicy_t`) are
+`g_ruleset.policy`; engine code reads them through `R_Policy()`. The engine reads the ruleset itself
+through `R_Rules()`, which a test can point at a modified copy with
+`R_RulesOverride`.
+
+**Products.** The catalog stays the storage. `product_t` (`R_ProductCount`,
+`R_ProductAt`, `R_ProductByUiId`) is the ruleset's view of one product: cost per
+resource, build time, producers, prerequisites. The catalog `can_purchase` and
+the build HUD read prices and affordability through it, so a map's price patch
+reaches both.
+
+**Tech paths.** `R_TechPath(owner, product)` turns the requirement vectors into
+the ordered steps an owner still needs: every unmet prerequisite building,
+upgrade level and tech level, recursively, plus a maker for each product on the
+way. The first step needs nothing the owner lacks. When a purchase is blocked,
+and the game enables `AI_FEATURE_RESEARCH`, the AI buys or researches the first
+step instead of skipping the goal (`ai_develop` in `play/p_ai.c`). Warcraft II's
+research gating (keep or stronghold, the root research) and StarCraft's upgrade
+levels live in `requirements` rows, which the catalog availability enforces for
+players too.
+
+Factions today: StarCraft Zerg, Terran and Protoss; Warcraft II Human and Orc;
+Dark Colony Human and Gray; Dark Reign Freedom Guard and Imperium; KKnD Survivors
+and Evolved; 7th Legion's Legion. Adding one means a row in `rules.c`. The AI
+needs no code for it.
+
+**Start units.** `faction_t.start_units` says what a melee start spawns around
+its start location, in the game's map units. StarCraft melee CHK seats (a start
+location and no placed unit) spawn the race's town hall, four workers and the
+Zerg Overlord from it. Warcraft II PUD slots with a start location and no other
+unit get a hall and one worker. 7th Legion's harvester comes from it too; its
+troopers and bases are counted by the mission script. Dark Colony, Dark Reign
+and KKnD place their start units in map data and spawn nothing from a start
+location, so their factions declare none.
+
+**Purchases are generic.** `owned`, `can_purchase`, `purchase` and
+`product_actor` in `AiGameInterface` are optional and default to the catalog
+(`game/g_ai.c`). The catalog `can_purchase` answers `AI_BUY_BLOCKED` for a
+missing prerequisite, producer or extra resource, `AI_BUY_NEED_CREDITS` for
+money, and `AI_BUY_NEED_TECH` when an owned producer lacks a `REQ_TECH` the
+product needs. Games keep a hook for what a catalog cannot say: Warcraft II
+prices builders in transit and structures placed at a site, StarCraft places
+buildings with a worker, Dark Colony buys through its own purchase queue, and
+KKnD deploys a drill rig from a derrick. `supply`, `is_busy`, `is_anchor` and
+`assign_harvester` remain game questions too.
+
+**Map overrides.** A map can change stats, as a Freeciv scenario can. At level
+load the game decodes the map's sections into table/row/field/value entries
+(`rulepatch_t`, `g_rulepatch`) and `G_DoLoadLevel` calls `R_PatchApply`. The
+checked-in table is the authority: every write goes through `R_PatchSet`, which
+logs the old value, and the next `R_PatchApply` puts it all back before laying
+the new patch down. `patch_done` refreshes what derives from the tables (actor
+types, catalog prices). The patch is hashed into the game slot of
+`G_ConsistencyVector`. Warcraft II decodes `UDTA` (sight, hit points, build
+time, costs, range, armor, damage, points), `UGRD` (upgrade time and costs) and
+`ALOW` (units and research a player may not have), `games/warcraft-2/w_pud.c`.
+No retail PUD carries `ALOW`, and the layout used (four sets of sixteen 32-bit
+masks: starting and forced allowances of units 0-31 and of the first 32 UGRD
+slots) follows the common PUD specification, which this repository does not
+include, so it is unchecked against a map from the original editor. StarCraft
+decodes `UNIx`/`UNIS` (hit points, shields on units that have them, armor,
+build time, costs, and the damage of every weapon row a custom unit fires),
+`UPGx`/`UPGS`, `TECx`/`TECS` and `PUNI` (units a player may not build),
+`games/starcraft/w_chk.c`. Weapons come from `weapons.dat` rows
+(`sc_weapons`, read into the actor types by `sc_unit_weapons` whenever
+`sc_refresh_actors` runs after a patch) and technologies from `techdata.dat`
+(`sc_techs`), whose `TECx` cost and time reach the research products.
+
+## Game implementations
+
+### Dark Colony
+
+`games/dark-colony/` contains the DC map, scenario, sprite, binary-table, actor,
+state, mission, and interaction code. Its coordinate and animation behavior is
+driven by MAP, SCN, SPR, FIN, and related original assets. Buildings are modeled
+as actors so selection, health, rendering, and production use the same object
+path as units.
+
+The game provides hardcoded `ActorType` gameplay values and authored
+`MobjInfo`/`State` animation data. `tools/dc_info_conv` inspects native FIN animations;
+`tools/dc_gamestat_gen` extracts reference balance tables from `data/DCOLONY`.
+
+### Dark Reign
+
+`games/dark-reign/` contains the REIGN map/scenario, tile, sprite, mission, actor,
+and product implementation. Scenario scripts and original map data determine
+team setup, buildings, construction crews, and resources. The game supplies
+the FG actor/product tables and the Dark Reign-specific 16-direction and tile
+conventions.
+
+Dark Reign reproduction takes precedence over generic abstraction when the
+original scenario or binary behavior requires a game-specific path.
+
+### StarCraft
+
+`games/starcraft/` builds its actor table from `units.inc`, `weapons.inc` and
+`techs.inc`, which `tools/sc_catalog` generates from the retail DATs. Combat
+follows weapons.dat: separate ground and air weapons (the Goliath and tanks
+fire from their turret subunit), hits per attack, splash and glaive bounces,
+explosive and concussive damage against unit size, armor and weapon upgrades
+(`games/starcraft/p_combat.c`). Protoss shields take hits first, regenerate
+and are recharged by Shield Batteries; casters keep energy, which pays for
+Ghost and Wraith cloaking; the Observer and Dark Templar are always cloaked.
+Units move at their flingy.dat top speed, or their walking script's pace when
+the script moves them. A sieged tank cannot shell what is nearer than its
+weapon's minimum range. Zerg larvae, eggs and morphs, creep and psi are described
+in `docs/SC_EXE_FINDINGS.md`.
+
+Units that carry or launch others are ordinary mobjs with a parent id
+(`games/starcraft/p_units.c`). A Carrier builds interceptors into its hangar
+and launches them at what it attacks; they fight with their own weapon, turn
+home past a 12-cell leash and dock. A Reaver builds scarabs and fires one per
+attack; it runs to the target and bursts with enemy splash. Siege mode is a
+deploy each way. Add-ons are built by their building and attach at units.dat's
+add-on position; a product whose add-on belongs to its maker (a Siege Tank's
+Machine Shop) needs that maker's own. A Bunker holds four Terran infantry,
+which fire from inside with one more cell of reach, cannot be targeted, and
+step out on Unload All or when it falls. Two High Templar walk together and
+warp into an Archon. A Nuclear Silo keeps one nuke for a Ghost to call down.
+
+Abilities follow techdata.dat (`games/starcraft/p_spell.c`): research is a
+product at its building and gates every ability but the melee defaults
+(Scanner Sweep, Defensive Matrix, Dark Swarm, Parasite, Archon Warp). A
+caster walks into range and pays its energy; a lasting effect is a timer on
+the units it touches (Matrix, Irradiate, Plague, Ensnare, Lockdown), and an
+area that lingers (Psionic Storm, Dark Swarm, Scanner Sweep) is a neutral
+mobj that ticks. Hallucinations deal nothing and take double damage. The
+computer player casts with its waves, sieges, mans Bunkers, refills hangars
+and researches what its units use (`p_tactics.c`). Not simulated: Stim
+Packs, Spider Mines, Burrow, Recall, Stasis Field, Infestation, transports
+and the Brood War units.
+
+### Other games
+
+`games/7legion/`, `games/kknd/`, `games/warcraft-2/` and `games/starcraft/`
+follow the same game interface where their current implementations support it.
+They share map/render/play infrastructure but are not required to expose every
+production or model feature yet.
+
+## Rendering and UI
+
+Rendering consumes loaded map data and actor/effect state. It does not decide
+gameplay outcomes. State tables provide the current sprite, frame, tics, and
+render flags; render code turns those values into screen-space draw calls.
+
+The model snapshot contains presentation-neutral actor/effect/decoration values
+and a declarative UI script. This lets the interactive renderer, tests, or a
+another frontend consume the same simulation without reaching into
+game internals.
+
+### HUD and sidebar architecture
+
+The front end and the HUD are both data. A game describes each screen as a
+table of `menuitem_t` (location, anchor, kind, pictures, fonts, text and
+routine) and hands it to the engine; the engine hit-tests, keeps focus, edits
+text, waits for map targets, scrolls lists, centres the view from a minimap
+and draws. Games keep only what is native: asset decoding, script parsing,
+gameplay routines and the odd `ownerdraw` for pictures the table cannot
+express.
+
+```text
+driver/w_image.c              W_LoadImage — engine BMP/PCX decoding
+hud/m_menu.c                  items: input, focus, text, targets, drawing
+hud/m_net.c                   shared multiplayer screens: create, browse, join, lobby chat
+game/g_save.c                 Doom-style saved games for every game but Dark Colony
+hud/m_main.c                  front end: M_* lifecycle, fallback screen
+hud/hu_bar.c                  shared HUD pieces: counters, clock, product
+                              list, route book
+include/engine.h              menu_t, menuitem_t and the game hooks
+
+games/dark-colony/sb_bar.c    MAINE script → HUD table
+games/dark-reign/hud/sb_bar.c native chrome, fonts and MFD pages as a table
+games/kknd, games/7legion     static HUD tables in g_game.c
+```
+
+The game exposes five hooks: `G_InitMenus`, `G_ControlPanel` and
+`G_ShutdownMenus` for the front end, `G_InitHUD` and `G_ShutdownHUD` for the
+level. `G_ControlPanel` returns the screen Escape opens; `M_SetupNextMenu`
+switches screens and `M_ClearMenus` closes them. `G_InitHUD` returns the
+level's table, which the driver feeds every event, tic and frame after it sets
+`hudview` (the units, sprites and messages the HUD shows). There is no
+per-game responder or drawer.
+
+A menu's `refresh` brings its items up to date before it takes an event or
+draws: which controls the selection shows, the money text, a product slot's
+icon. Its `ticker` replaces the plain animation step when the screen polls
+the network or scrolls credits, and `drawtip` draws the tooltip of the item
+under the pointer.
+
+`W_LoadImage` handles BMP and single-plane 8-bit RLE PCX decoding for any
+game; interpreting the PCX font delimiter row is Dark Reign HUD behavior. No
+PNG dependency or generated replacement chrome is used. Product stats and
+queue rules remain in `games/dark-reign/p_prod.c`; scenario technology limits
+and definition order belong to the active level's mission.
+
+The Dark Reign HUD's supported interactions are production, scrolling, camera
+panning through the radar and the engine resume/quit popup. The native page
+labels are no longer repurposed as unrelated production categories or commands.
+Remaining retail page, gauge and radar-terrain work is documented with the
+executable evidence in `docs/DR_EXE_FINDINGS.md`.
+
+The production image catalog covers both factions; either faction's selected
+construction rig switches the BUILD list to structures. Dark Reign's authored
+unit flags preserve retail Fly, IsHuman and NoAutoTarget independently of the
+generated animation table. Medic, Mechanic and Karoch support capabilities run
+through ordinary mobj state actions with class-restricted allied targets.
+The executable findings distinguish these supported behaviors from unfinished
+special abilities, attachment types and native HUD pages.
+
+## Saved games and multiplayer screens
+
+`game/g_save.c` saves as Doom's `p_saveg.c` does: the menu sets `g_savefile`
+(or `g_loadfile` and the map to reload), and the driver saves or restores
+between tics. The level loads from its map first; the save holds what play
+changes: each mobj with pointers turned into ids, resources, research, vents,
+sight, the clock, the AI and HUD text. A save is checksummed, tied to the map
+file and the game tables, and refused if either differs. A game with more state
+defines `G_SaveExtraSize`, `G_SaveExtra` and `G_LoadExtra` (Warcraft II stores
+its dice and campaign progress). Dark Colony keeps its own saver because it also
+archives mission scripts and skirmish setups.
+
+`hud/m_net.c` is the multiplayer UI over the `I_*` menu transport. A game
+calls `M_NetOpen` with a `netui_t`: its art and font, a style callback for the
+buttons and labels, the maps a host can offer and label text. The module owns
+the flow (create game, LAN browser, address entry, lobby with chat, launch).
+`M_MenuMultiplayer` gives the plain fallback front ends (KKnD, 7th Legion) a
+Multiplayer button, and Warcraft II dresses the same screens in its REZDAT panel.
+
+## Menu lifecycle versus HUD
+
+`include/engine.h` exposes the Doom-style `M_Init`, `M_StartControlPanel`,
+`M_Responder`, `M_Ticker`, `M_Drawer`, and `M_Shutdown` lifecycle, implemented
+once in `hud/m_main.c` over `currentmenu`. Dark Colony and Dark Reign build
+their native screens in `games/<game>/menu/`; the other games hand a static
+Start/Resume/Quit table to `M_SimpleControlPanel`.
+These are engine fallback screens, with the existing small glyph font, not
+reproductions of those games' retail front ends. Escape opens them during a
+level; their existing automatic level startup is preserved. Native screen
+parsing, assets, animation selection and campaign dispatch belong to the game,
+outside its level HUD.
+
+The same header declares the engine's menu and HUD framework. A screen is a `menu_t`
+holding a C array of `menuitem_t`: kind, id, rectangle and anchor, sheet cell,
+palette map and font per state (normal, focused, pushed), text and alignment,
+tooltip, list rows, and a routine.
+The game fills the table once when a screen loads and changes item fields
+afterwards. `M_MenuResponder` hit-tests, keeps focus, edits text fields and
+calls the routines. It owns widget state: a check box toggles, or is one of a
+`group` where exactly one is set; a list keeps its selected row and scroll
+position, moved by clicks, Up/Down, the wheel, its scroll bar and any button
+whose `link` and `step` name it; and SDL text input is on only while a text
+field has focus. A routine sees `MA_ACTIVATE`, `MA_CHANGE`, right-click
+`MA_SECONDARY`, HUD wheel `MA_WHEEL`, `MA_TARGET` and `MA_CANCEL` actions.
+Modal screens consume input; HUD screens consume hotkeys and mouse clicks on
+visible chrome, leaving world input to the caller. `M_MenuTarget` makes an
+item wait for a click on the world (a move order, a waypoint): the engine
+hands it the click as `MA_TARGET`, and the right button or Escape as
+`MA_CANCEL`. `M_MenuEdit` gives a HUD text field the keyboard until Enter or
+Escape, as Dark Colony's chat line does. An `MI_MINIMAP` item centres the
+world view on the clicked or dragged cell. On a screen larger than the table's
+`size`, items follow their `anchor` to the right or bottom edge, or the whole
+table `stretch`es. Hover and pressed looks come from the shared responder.
+`M_MenuDrawer` draws the background, pictures, button
+labels, loose text, lists, scroll bars and the text caret. Pictures and buttons
+draw first in table order and loose text, lists and scroll bars draw over them;
+a `layer` item, such as a popup's backdrop, starts that order again over
+everything before it.
+An item's `ownerdraw` supplies native content after its standard picture,
+such as Dark Colony's FIN gadgets and digit pictures. Fonts with
+`own_palette` (Dark Reign's PCX strips, Dark Colony's HUD font) are matched
+into the screen palette, so native text needs no ownerdraw. Dark Colony's table is indexed by the native control
+ID from its `INTRFACE/*E` scripts.
+
+Dark Colony's MAINE HUD also loads a single item table. The engine draws its
+chrome, buttons and purchase counters and dispatches tabs, orders, purchase
+and refund callbacks, and draws the label, message and day fields as text
+items. The minimap picture, money digits and day dial use `ownerdraw`;
+gameplay callbacks still decide which products and abilities are visible and
+what a world-targeted command means. Screen images remain
+separate from gameplay sprite IDs.
+
+Dark Reign's HUD is one item table too: chrome bitmaps, the money text, the
+PATHS page pictures and captions, the action and path controls, the product
+grid and hidden hotkeys. Product slots refresh their borrowed icon and product
+references as selection or page changes. The engine dispatches controls and
+owns their hover/pressed looks, page-wheel events, saved-path list scrolling,
+map targets and chrome click consumption. The game retains what world orders
+mean, the tooltip box and the minimap content.
+
+Animation is split along the same line. Every item carries a `menuanim_t`: a
+frame range, the current frame, a loop / one-off / stopped mode and the ticks
+left on the frame. `M_MenuTicker` steps every visible running item, and the
+menu's `frametics` callback says how long the current frame lasts. What a frame
+looks like, and which item starts when, stay with the game: Dark Colony draws
+the FIN frame in `ownerdraw`, and its `banim` entrance (each gadget covering a
+button starts when the previous one reaches its third frame, then hides) is a
+few lines over `anim` in its own ticker, because that rule and its data are
+DC.EXE's.
+
+The driver opens DC's menu before allocating a level, mission, thinkers or
+sidebar. `menumap` is a deferred level request: menu input selects a native
+campaign table entry, then the driver runs its ordinary loading path. Starting
+another campaign first tears down the old level and its owners. Menu images and
+FIN records have a screen owner; their image cache is never registered in
+gameplay `sprnames[]`. GIF decoding and GPU resources remain engine-owned code.
+
+Menu input precedes cheats, sidebar responders and world commands. Menu drawing
+runs last. Menu animation has a wall-clock lifecycle, independent of simulation
+and the HUD. Single-player menu pause continues the command/tic clock but skips
+world, mission, production and HUD tickers. Network simulation continues while
+the local menu is open; a network player cannot start a replacement campaign.
+
+Doom itself enters its title/demo loop by default, and opens the menu on input;
+`autostart` (including `-warp`) or a network game calls `G_InitNew` instead.
+Opening DC's menu immediately, accepting `-map=`, and keeping automated checks
+on the default level are explicit open-rts startup policies.
+
+## Sound
+
+`sound/` is an engine subsystem linked into every game, alongside `play/`,
+`render/` and `hud/`. It follows Doom: `s_sound.c` owns sample caching,
+sound channels, the listener and
+origin tracking; `i_sound.c` is the platform layer, an SDL audio callback that
+mixes samples converted at load to 16-bit mono. The simulation starts sounds
+the way Doom's `P_` code does (`S_ActorSound(actor, SE_DEATH)` in
+`P_DamageMobj`, `SE_ATTACK` in `P_Attack`, `SE_DEPLOY`, `SE_EXPLODE`), and the
+interface starts barks and UI sounds (`S_Bark` from order and selection input,
+`S_StartUISound` from menu activation and HUD messages).
+
+A game opts in with `gameinfo_t.sound`, a `soundinfo_t` that registers its sfx
+table (`S_AddSfx`), maps actor events to sfx ids, and runs per-frame ambience.
+Like Hexen's SNDINFO `$random`, an sfx can be a group whose members play in
+turn with a random cursor; a group's priority orders barks. Games without a
+`soundinfo_t` are silent.
+
+Games supply native sound names, archive bytes, event assignments and native
+parameters. They call the engine's `S_` API; only the engine calls the platform
+`I_` sample/mixer API. Loose WAV names are loaded by `S_Init`; archive loaders
+pass extracted WAV bytes to `S_LoadSound`. The engine converts, owns and frees
+every sample, including partial initialization failures. Games never assign
+sample pointers or create a mixer. The synthetic-WAV regression in
+`tests/shared/test_sound.c` exercises this boundary under every game build
+without any retail data; per-game tests verify native sound definitions.
+
+Rules the engine applies for every game:
+
+- Barks answer only the owning player (`consoleplayer`), one voice at a time,
+  and the selected unit type with the best priority speaks.
+- World sounds fade with the distance from the centre of the world view
+  (centibels per squared cell, with a silence cutoff) and pan with the
+  horizontal offset. Channels following a moving object are re-spatialized
+  every frame; a freed object leaves its one-shot sounds where it was and
+  stops its loops.
+- Another player's sounds play only from cells the local player currently
+  sees, so fog cannot be heard through.
+- Playback never reads or writes simulation state or the gameplay RNG
+  (`S_Random` is separate), so lockstep peers may hear different things.
+  `--check`, `--screenshot`, `--net-check`, ordinary model tests and `--nosound`
+  never open an audio device, and playback calls are then no-ops. Audio
+  regressions explicitly initialize SDL's dummy audio driver.
+
+Dark Colony's tables come from `SOUND/SOUND2.DAT`, `SOUND/SLIST.DAT` and the
+tileset's `.AMB`; see `games/dark-colony/sounds.c` and the sound section of
+`docs/DC_EXE_FINDINGS.md`.
+
+Warcraft II supplies WAV entries from `SFXDAT.SUD` and `MAINDAT.WAR` through
+the same engine API; see `games/warcraft-2/sounds.c`. Neither game's sound
+implementation depends on the other game directory.
+
+## Determinism and networking
+
+Simulation state is advanced from commands and ticks, and multiplayer is
+lock-step. `driver/d_net.c` and `driver/i_net.c` exchange `ticcmd_t`s over UDP:
+every peer applies the same commands for a tic and runs the whole simulation,
+and rendered frames are never simulation input (`docs/NETWORK.md` covers hosting
+and joining). Stable IDs, fixed simulation ticks, state-machine transitions, and
+model events are also the foundation for replay.
+
+Time is counted in whole tics (`RTS_TICRATE`, `FIXED_DT`). In a network game
+`rts_game_model_tick` ignores the `dt` it is given and advances one tic of
+`FIXED_DT` when every command has arrived; tests pass the same constant. Positions and momentum are 16.16 fixed point. Some float arithmetic
+remains in steering, navigation distances and facing, and is being moved to
+fixed point (issue #74); until then Apple Silicon and x86 peers can disagree
+about fused multiply-adds, which the desync check below would catch.
+
+### Desync detection and resync
+
+`G_ConsistencyVector` hashes the simulation one subsystem at a time (globals,
+resources, upgrades, thinkers, and a `game` slot that a game fills through
+`G_ConsistencyExtra`). Every ticcmd carries the vector for the state
+`BACKUPTICS` tics earlier. When a peer's vector differs, `driver/d_net.c`
+reports the first tic whose state differed and the subsystems that disagree,
+not just two hashes. The packet layout changed, so `NETVERSION` and the session
+version were bumped; peers on the old protocol are refused at setup.
+
+With handlers installed (`D_SetNetResync`; `d_main` and the game model do),
+a desync is repaired instead of ending the game. The lowest seated player
+freezes at a tic boundary, serializes its game with `G_SaveGameBlob`, and sends
+the save in chunks inside `NCMD_RESYNC` packets (a `TC_RESYNC` ticcmd whose
+`units[]` carry the bytes). Each peer reloads it with `G_ResyncLoad` (its own
+camera, HUD messages and selection survive), acknowledges, and the authority
+restarts lockstep when everyone has. Tic packets carry the resync epoch in
+their checksum, so a late packet from the old timeline is dropped. Orders a
+player issued during the resync window are lost. After three resyncs in one
+game the next desync is fatal, and a game whose `G_SaveExtra` misses state
+shows up as another desync rather than as silent drift. A peer that leaves a
+game cannot rejoin: sessions have no late join.
+
+## Trust model
+
+Lockstep means every peer holds the complete game state and runs the whole
+simulation. Fog of war is drawn, not enforced: a modified client can read the
+whole map and every order. Peers also trust each other's commands, and the
+resync save is trusted from the authority. This is a design limit, acceptable
+for LAN preservation play among friends and unsuitable for ranked or public
+matches. An authoritative server (as Freeciv has) would be a different
+architecture.
+
+## Shared code names no game
+
+Shared directories (`driver render hud interface play game sound include`)
+never test which game is being built. Behaviour a game picks lives in
+`g_ruleset.policy` (a `rulepolicy_t` of input, sight, turning, selection, F10 and
+stance enums) or `gameinfo_t` (detail thresholds are plain fields). Behaviour a game
+adds is a weak hook declared in `include/engine.h` with its default in
+`game/g_hooks.c`; the game defines it under `games/<id>/`. Compile-time shape
+(level fields, queue length, `RTS_MODULE_*` capability macros for code that
+touches game-only `mobj_t` fields, `RTS_LEVEL_COLUMN_MAJOR` for 7th Legion's cell
+layout) comes from `games/<id>/game_config.h`, as `MOBJ_GAME_FIELDS` comes from
+`mobj_data.h`. Sight, harvesting and queue rules that used to be `RTS_MODULE_*`
+branches are hooks too (`G_SightRadius`, `G_DetectorSight`, `G_SightUpdated`,
+`G_ViewerSees`, `G_GameHarvestAt`, `G_QueueLocksProduct`). `play/p_mobj.c` and
+`play/p_build.c` still carry `RTS_MODULE_*` branches. `make check-ifdefs`, part of
+`make test` and CI, fails on `RTS_GAME_<ID>` in shared code.
+
+## Testing and build structure
+
+`make` builds each game binary. Source lists are collected with `find`, so adding
+a source file inside an engine or game directory does not require editing the
+Makefile.
+
+Headless coverage includes:
+
+- DC scenario and sprite/FIN layout checks;
+- DC and DR command acceptance and event-lifecycle checks;
+- movement, attack command, production queue, unit completion, building
+  completion, stable IDs, resources, and producer/product event payloads.
+
+Use `make test` for the model tests and set `SDL_VIDEODRIVER=dummy` for binary
+smoke checks. Reverse-engineering notes and stable asset/binary findings belong
+in `REFERENCES.md`; generated reverse-engineering dumps remain ignored.
